@@ -18,6 +18,5 @@ It is **strongly recommended** that you have a premium subscription to the datin
 
 ## How to Use
 1. Set up the Projection feature on your MacOS to mirror your iPhone.
-2. git command test
 
 
