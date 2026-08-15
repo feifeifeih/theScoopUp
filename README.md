@@ -8,7 +8,7 @@
 
 - **MacOS (version 15 or later)**
 - **iPhone (iOS 18 or later)**
-- Utilizes the **Projection** feature on MacOS to connect and interact with your iPhone.
+- Uses Apple's **iPhone Mirroring** app to interact with your iPhone.
 
 ---
 
@@ -20,40 +20,63 @@ It is **strongly recommended** that you have a premium subscription to the datin
 
 ## How to Use
 
-1. **Set up Projection:**  
-   Set up the Projection feature on your MacOS to mirror your iPhone, and make sure the app is runing
+1. **Install dependencies:**
 
-2. **Launch the Script:**  
-   Run the script on your MacOS. A GUI window will appear with an initial size of 400x360.
+   ```bash
+   cd /Users/fei/Desktop/SideProject/theScoopUp
+   source myenv/bin/activate
+   python -m pip install -r requirements.txt
+   ```
 
-3. **Coordinate Selection:**
-   - **Heart Area Inputs:**  
-     Click on your screen to automatically fill in the “Heart area top left” and “Heart area bottom right” fields.
-   - **Popup Confirmation:**  
-     Once the heart area fields are filled, a popup will appear instructing you:  
-     *"You can click the heart to start filling the next 2 location"*  
-     Click the **Done** button to continue.
-   - **'Sent Like' Inputs:**  
-     After dismissing the popup, click again to fill in the **'Sent Like' top left** and **'Send Like' bottom right** fields.
+2. **Open iPhone Mirroring:**
+   Connect the iPhone, open Tinder or Hinge, and keep the iPhone Mirroring window visible.
 
-4. **Set Rotations:**  
+3. **Launch The Scoop UP:**
+
+   ```bash
+   python main_scoop.py
+   ```
+
+   Or open the standalone V1.0.0 app at `dist/The Scoop UP V1.0.0.app`.
+
+4. **Choose the App:**
+   Select **Hinge** or **Tinder**. No window coordinates, heart location, or button location are required.
+
+5. **Set Rotations:**
    Enter the number of rotations (i.e., how many cycles of actions you want the script to perform).
 
-5. **Start the Simulation:**  
+6. **Start the Simulation:**
    Click the **Start** button to begin the automated clicking process. The script will:
-   - Randomly click within the specified Heart area.
-   - Then click within the 'Sent Like' area.
-   - Repeat this for the number of rotations provided.
+   - Automatically locate the iPhone Mirroring window before every scan.
+   - **Tinder:** find the heart at its current position → click → wait 2 seconds → repeat.
+   - **Hinge:** scan for the white-heart/black-circle button for up to 2 seconds → when found, click it 3 times and wait 1 second for the UI → search for Send Priority Like for up to 2 seconds and click it 3 times when found. If the heart is missing, the app tries Send Like directly in case the confirmation UI is already open.
+   - Skip a click whenever its required visual target is not detected.
 
-6. **Stop the Simulation:**  
-   At any time during the simulation, press the **ESC** key to pause/stop the automation. (Must select the program panel before press **ESC**, or it won't stop, so you gotta be fast)
+7. **Stop the Simulation:**
+   Click **Stop** at any time. You can also press **Esc** while the control panel is focused.
+
+On first use, allow Terminal or Python under **System Settings → Privacy & Security → Accessibility** and **Screen & System Audio Recording**, then restart the program. If screen capture is blocked, the app displays an **Open Screen Recording Settings** button that opens the correct permissions page directly.
 
 ---
 
 ## Additional Information
 
-- The script uses **Tkinter** for the GUI and **pynput** for capturing mouse events and simulating clicks.
-- The random clicking within the defined areas ensures varied interactions, simulating human behavior.
+- The script uses native macOS window metadata, Quartz screen capture, and Vision text recognition.
+- Heart matching runs at native Retina capture resolution; only the final click point is converted to desktop coordinates.
+- A heart-analysis timeout is retried on the next cycle and is not treated as a completed “no heart” result.
+- Target detection runs again after every state-changing click; coordinates are never reused.
+- Heart and Send Priority Like clicks target the center of a positively detected visual target.
 - For any issues or further customization, please refer to the code comments for guidance.
 
 Happy swiping, and enjoy the time saved with The Scoop UP!
+
+---
+
+## Build the Standalone App
+
+```bash
+source myenv/bin/activate
+python -m PyInstaller --clean --noconfirm main_scoop.spec
+```
+
+The reusable macOS application is created at `dist/The Scoop UP V1.0.0.app`.
