@@ -18,8 +18,8 @@ A macOS helper that uses **iPhone Mirroring** to automate Hinge likes and option
 
 ## Install
 
+clone this repo
 ```bash
-git clone https://github.com/YOUR_USERNAME/theScoopUp.git
 cd theScoopUp
 python3 -m venv .venv
 source .venv/bin/activate
