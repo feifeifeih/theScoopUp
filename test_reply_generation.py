@@ -5,7 +5,9 @@ import unittest
 from profile_reply import CapturedPrompt
 from reply_generation import (
     GeneratedReply,
+    LOCAL_FREE_MODEL,
     OllamaReplyGenerator,
+    PAY_MODEL,
     ReplyGenerationError,
     ReplyGenerator,
     TONE_INSTRUCTIONS,
@@ -136,7 +138,7 @@ class ReplyGenerationTests(unittest.TestCase):
 
         self.assertEqual(result.prompt_id, "prompt-1")
         call = client.responses.calls[0]
-        self.assertEqual(call["model"], "gpt-5.6-luna")
+        self.assertEqual(call["model"], PAY_MODEL)
         self.assertTrue(call["text"]["format"]["strict"])
 
     def test_retries_once_after_malformed_output(self):
@@ -208,7 +210,7 @@ class ReplyGenerationTests(unittest.TestCase):
 
     def test_free_local_generator_uses_ollama_without_an_api_key(self):
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             {"response": json.dumps({
                 "prompt_id": "prompt-1",
                 "reply": "Trivia rivals first, victory fries after?",
@@ -223,14 +225,14 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertEqual(result.prompt_id, "prompt-1")
         generation_request = opener.requests[1][0]
         payload = json.loads(generation_request.data)
-        self.assertEqual(payload["model"], "qwen3.5:9b")
+        self.assertEqual(payload["model"], LOCAL_FREE_MODEL)
         self.assertFalse(payload["think"])
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["format"]["required"], ["prompt_id", "reply"])
 
     def test_qwen_photo_generation_sends_image_and_returns_grounded_line(self):
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             {"message": {"content": json.dumps({
                 "usable": True,
                 "category": "object",
@@ -251,12 +253,12 @@ class ReplyGenerationTests(unittest.TestCase):
         payload = json.loads(request.data)
         encoded = payload["messages"][0]["images"][0]
         self.assertEqual(base64.b64decode(encoded), image)
-        self.assertEqual(payload["model"], "qwen3.5:9b")
+        self.assertEqual(payload["model"], LOCAL_FREE_MODEL)
         self.assertFalse(payload["think"])
 
     def test_qwen_prompt_detection_sends_viewport_and_extracts_exact_text(self):
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             {"message": {"content": json.dumps({
                 "has_written_prompt": True,
                 "prompt": "Together, we could",
@@ -274,7 +276,7 @@ class ReplyGenerationTests(unittest.TestCase):
         request = opener.requests[1][0]
         payload = json.loads(request.data)
         self.assertEqual(base64.b64decode(payload["messages"][0]["images"][0]), image)
-        self.assertEqual(payload["model"], "qwen3.5:9b")
+        self.assertEqual(payload["model"], LOCAL_FREE_MODEL)
         self.assertFalse(payload["think"])
         self.assertEqual(
             payload["format"]["required"],
@@ -283,7 +285,7 @@ class ReplyGenerationTests(unittest.TestCase):
 
     def test_single_prompt_mode_binds_invented_local_prompt_id(self):
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             {"response": json.dumps({
                 "prompt_id": "invented-id",
                 "reply": "Trivia rivals deserve dramatically oversized trophies.",
@@ -299,7 +301,7 @@ class ReplyGenerationTests(unittest.TestCase):
 
     def test_local_grounding_retry_locks_to_selected_prompt(self):
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             {"response": json.dumps({
                 "prompt_id": "prompt-1",
                 "reply": "Guess that's one way to show you care",
@@ -329,7 +331,7 @@ class ReplyGenerationTests(unittest.TestCase):
             })
         }
         opener = FakeOpener([
-            {"models": [{"name": "qwen3.5:9b"}]},
+            {"models": [{"name": LOCAL_FREE_MODEL}]},
             ungrounded,
             ungrounded,
             ungrounded,
@@ -348,11 +350,30 @@ class ReplyGenerationTests(unittest.TestCase):
 
     def test_free_local_generator_reports_missing_model(self):
         opener = FakeOpener([{"models": []}])
-        with self.assertRaisesRegex(ReplyGenerationError, "ollama pull qwen3.5:9b"):
+        with self.assertRaises(ReplyGenerationError) as ctx:
             OllamaReplyGenerator(opener=opener).generate(
                 [self.prompt],
                 "Playful & clean",
             )
+        self.assertIn(f"ollama pull {LOCAL_FREE_MODEL}", str(ctx.exception))
+
+    def test_custom_local_free_model_is_requested(self):
+        opener = FakeOpener([
+            {"models": [{"name": "llama3.2-vision:latest"}]},
+            {"response": json.dumps({
+                "prompt_id": "prompt-1",
+                "reply": "Trivia rivals first, victory fries after?",
+            })},
+        ])
+
+        result = OllamaReplyGenerator(
+            model="llama3.2-vision:latest",
+            opener=opener,
+        ).generate([self.prompt], "Playful & clean")
+
+        self.assertEqual(result.prompt_id, "prompt-1")
+        payload = json.loads(opener.requests[1][0].data)
+        self.assertEqual(payload["model"], "llama3.2-vision:latest")
 
 
 if __name__ == "__main__":

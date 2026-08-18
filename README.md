@@ -1,5 +1,7 @@
 # The Scoop UP
 
+**Version 2.0.0**
+
 A macOS helper that uses **iPhone Mirroring** to automate Hinge likes and optional prompt replies.
 
 **Current status:** **Hinge is the only supported, tested app.** A Tinder option still appears in the UI, but Tinder detection and clicking have **not** been checked or verified. Do not rely on Tinder mode.
@@ -26,16 +28,59 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-### Optional: local replies (no API key)
+### Free local LLM (recommended)
 
-Prompt Reply defaults to **Local — Free**, which uses [Ollama](https://ollama.com/download) on your Mac. Profile text stays on this computer.
+Prompt Reply defaults to **Local — Free**. That uses [Ollama](https://ollama.com/download) on your Mac — no API key, and profile text stays on this computer.
 
-```bash
-brew install ollama
-ollama pull qwen3.5:9b
-```
+The local model name lives in `reply_generation.py` as `LOCAL_FREE_MODEL`. This release prefers **qwen3.5:9b**.
 
-The model needs about 6.6 GB of disk space. The first launch can take 20–40 seconds. The Scoop UP starts Ollama automatically if it is installed.
+#### Preferred: qwen3.5:9b
+
+1. Install Ollama:
+
+   ```bash
+   brew install ollama
+   ```
+
+   Or download the Mac app from [ollama.com/download](https://ollama.com/download).
+
+2. Pull the preferred model:
+
+   ```bash
+   ollama pull qwen3.5:9b
+   ```
+
+3. Confirm it is listed:
+
+   ```bash
+   ollama list
+   ```
+
+   You should see `qwen3.5:9b`. Leave `LOCAL_FREE_MODEL = "qwen3.5:9b"` as-is. The Scoop UP starts Ollama automatically if it is installed.
+
+The model needs about 6.6 GB of disk space. The first launch can take 20–40 seconds.
+
+#### Using a different local model
+
+Prompt Reply reads the mirrored screen (written prompts and photos), so pick a **vision-capable** model. Quality and speed will vary; **qwen3.5:9b** is the one this release is built around.
+
+1. Pull your model and copy the exact name from `ollama list` (including the tag, such as `:latest` or `:11b`):
+
+   ```bash
+   ollama pull llama3.2-vision
+   ollama list
+   ```
+
+2. Open `reply_generation.py` and change the local model constant:
+
+   ```python
+   PAY_MODEL = "gpt-5.6-luna"
+   LOCAL_FREE_MODEL = "llama3.2-vision:latest"
+   ```
+
+3. Restart The Scoop UP (`python main_scoop.py`). If you already built the standalone app, rebuild it so the new name is included.
+
+If the name does not match an installed model, the app will tell you to run `ollama pull <model>`.
 
 ### Optional: OpenAI replies
 
@@ -44,6 +89,8 @@ Set a key only if you choose **OpenAI API** in the app:
 ```bash
 export OPENAI_API_KEY="your-api-key"
 ```
+
+The paid model name lives in `reply_generation.py` as `PAY_MODEL` (default `gpt-5.6-luna`). To use a different OpenAI model, change that constant and restart (or rebuild the app).
 
 Never commit this key. The OpenAI engine sends recognized prompt/answer text only — not photos or screenshots.
 
@@ -91,14 +138,16 @@ source .venv/bin/activate
 python -m PyInstaller --clean --noconfirm main_scoop.spec
 ```
 
-The app is written to `dist/The Scoop UP V1.0.0.app`.
+The app is written to `dist/The Scoop UP V2.0.0.app`.
 
 If you use OpenAI with the standalone build, launch it from Terminal so the key is available:
 
 ```bash
 OPENAI_API_KEY="your-api-key" \
-  "dist/The Scoop UP V1.0.0.app/Contents/MacOS/The Scoop UP V1.0.0"
+  "dist/The Scoop UP V2.0.0.app/Contents/MacOS/The Scoop UP V2.0.0"
 ```
+
+A different `PAY_MODEL` or `LOCAL_FREE_MODEL` only takes effect in the `.app` after you rebuild.
 
 ---
 

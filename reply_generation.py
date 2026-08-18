@@ -13,8 +13,8 @@ from urllib import error as url_error
 from urllib import request as url_request
 
 
-MODEL = "gpt-5.6-luna"
-OLLAMA_MODEL = "qwen3.5:9b"
+PAY_MODEL = "gpt-5.6-luna"
+LOCAL_FREE_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 MAX_REPLY_LENGTH = 140
 TONE_INSTRUCTIONS = {
@@ -334,7 +334,7 @@ def _generate_with_retries(
 
 
 class ReplyGenerator:
-    def __init__(self, client=None, model=MODEL):
+    def __init__(self, client=None, model=PAY_MODEL):
         if client is None:
             if not os.environ.get("OPENAI_API_KEY"):
                 raise ReplyGenerationError(
@@ -387,7 +387,7 @@ class ReplyGenerator:
 class OllamaReplyGenerator:
     """Generate replies with a local Ollama model and no API key."""
 
-    def __init__(self, model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, opener=None):
+    def __init__(self, model=LOCAL_FREE_MODEL, base_url=OLLAMA_BASE_URL, opener=None):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.opener = opener or url_request.urlopen
