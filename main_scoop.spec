@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
+
+sys.setrecursionlimit(sys.getrecursionlimit() * 5)
+
 
 a = Analysis(
     ['main_scoop.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['AppKit', 'Quartz', 'Vision'],
+    hiddenimports=['AppKit', 'CoreMedia', 'objc', 'Quartz', 'ScreenCaptureKit', 'Vision'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

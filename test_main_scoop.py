@@ -1,4 +1,10 @@
 import unittest
+from contextlib import contextmanager
+import struct
+import threading
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from main_scoop import (
     HeartIconDetector,
@@ -10,7 +16,13 @@ from main_scoop import (
     WindowCapture,
     _normalize_text,
     _window_score,
+    find_send_priority_like,
+    format_elapsed_time,
+    is_safe_iphone_action_point,
+    first_profile_photo_png,
 )
+from profile_reply import CapturedPrompt, ProfileScan, ScreenText
+from reply_generation import GeneratedReply
 
 
 def make_frame(width, height, colored_points, color):
@@ -146,6 +158,16 @@ class AutomaticDetectionTests(unittest.TestCase):
         self.assertIsNotNone(location)
         self.assertGreater(score, 0.84)
 
+    def test_first_profile_photo_is_cropped_to_bounded_png(self):
+        capture = make_capture(make_frame(400, 800, [], (30, 80, 160)))
+        image = first_profile_photo_png(capture, (300, 650), max_edge=256)
+
+        self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+        width, height = struct.unpack(">II", image[16:24])
+        self.assertLessEqual(max(width, height), 256)
+        self.assertGreater(width, 80)
+        self.assertGreater(height, 80)
+
     def test_plain_black_circle_is_not_the_hinge_heart_button(self):
         size = 72
         circle = [
@@ -173,6 +195,25 @@ class AutomaticDetectionTests(unittest.TestCase):
     def test_send_like_text_normalization(self):
         self.assertEqual(_normalize_text("Send Priority Like!"), "send priority like")
 
+    def test_elapsed_time_is_compact_and_readable(self):
+        self.assertEqual(format_elapsed_time(8.4), "8s")
+        self.assertEqual(format_elapsed_time(128), "2m 8s")
+        self.assertEqual(format_elapsed_time(3723), "1h 2m 3s")
+
+    def test_action_guard_rejects_home_area(self):
+        capture = make_capture(make_frame(400, 800, [], (0, 0, 0)))
+        self.assertTrue(is_safe_iphone_action_point(capture, (300, 650)))
+        self.assertFalse(is_safe_iphone_action_point(capture, (300, 770)))
+
+    def test_dialog_send_fallback_rejects_home_area(self):
+        app = object.__new__(ScoopUpApp)
+        capture = make_capture(make_frame(400, 800, [], (0, 0, 0)))
+        comment_point = (300, 735)
+        with patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")):
+            point, score, _ = app.find_send_for_dialog(capture, [], comment_point)
+        self.assertIsNone(point)
+        self.assertEqual(score, 0.0)
+
     def test_screen_recording_settings_uses_privacy_deep_link(self):
         self.assertTrue(SCREEN_RECORDING_SETTINGS_URL.startswith("x-apple.systempreferences:"))
         self.assertIn("Privacy_ScreenCapture", SCREEN_RECORDING_SETTINGS_URL)
@@ -193,6 +234,524 @@ class AutomaticDetectionTests(unittest.TestCase):
 
         self.assertEqual(app.mouse.position, (123, 456))
         self.assertEqual(app.mouse.clicks, 3)
+
+    def test_heart_scan_is_single_flight_and_drains_native_pool(self):
+        app = object.__new__(ScoopUpApp)
+        app.fresh_capture = lambda: object()
+        app.heart_detector = SimpleNamespace(
+            find=lambda _capture, _platform: ((123, 456), 0.91)
+        )
+        pool_events = []
+
+        @contextmanager
+        def tracked_pool():
+            pool_events.append("enter")
+            try:
+                yield
+            finally:
+                pool_events.append("exit")
+
+        with (
+            patch("main_scoop.native_autorelease_pool", tracked_pool),
+            patch("main_scoop.threading.Thread") as thread_class,
+        ):
+            result = app.find_heart_before("Hinge", time.monotonic() + 1)
+
+        self.assertEqual(result, ((123, 456), 0.91, False))
+        self.assertEqual(pool_events, ["enter", "exit"])
+        thread_class.assert_not_called()
+
+    def test_profile_scroll_uses_negative_pixel_events_for_next_viewport(self):
+        class FakeMouse:
+            def __init__(self):
+                self.positions = []
+
+            @property
+            def position(self):
+                return self.positions[-1] if self.positions else None
+
+            @position.setter
+            def position(self, value):
+                self.positions.append(value)
+
+        class FakeRunningApplication:
+            def __init__(self):
+                self.activations = []
+
+            def activateWithOptions_(self, options):
+                self.activations.append(options)
+
+        running_app = FakeRunningApplication()
+        fake_appkit = SimpleNamespace(
+            NSApplicationActivateIgnoringOtherApps=99,
+            NSRunningApplication=SimpleNamespace(
+                runningApplicationWithProcessIdentifier_=lambda _pid: running_app
+            ),
+        )
+        posted = []
+        fake_quartz = SimpleNamespace(
+            kCGScrollEventUnitPixel=1,
+            kCGHIDEventTap=2,
+            CGEventCreateScrollWheelEvent=lambda _source, _unit, _count, delta: delta,
+            CGEventPost=lambda _tap, event: posted.append(event),
+        )
+
+        app = object.__new__(ScoopUpApp)
+        app.mouse = FakeMouse()
+        app.is_running = True
+        window = MirroringWindow(7, 1, "iPhone Mirroring", "iPhone", 100, 50, 400, 800)
+
+        with (
+            patch("main_scoop.find_iphone_mirroring_window", return_value=window),
+            patch("main_scoop.AppKit", fake_appkit),
+            patch("main_scoop.Quartz", fake_quartz),
+            patch("main_scoop.time.sleep"),
+        ):
+            app.scroll_profile("down")
+
+        self.assertEqual(posted, [-140, -140])
+        self.assertEqual(running_app.activations, [99])
+
+
+class PromptReplyOrchestrationTests(unittest.TestCase):
+    def make_app(self):
+        app = object.__new__(ScoopUpApp)
+        app.is_running = True
+        app.total_rotations = 1
+        app.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        app.start_button = SimpleNamespace(config=lambda **_kwargs: None)
+        app.statuses = []
+        app.set_status = lambda message, **_kwargs: app.statuses.append(message)
+        app.interruptible_wait = lambda _seconds: None
+        app.fresh_capture = lambda: SimpleNamespace(
+            window=SimpleNamespace(left=0, top=0, width=400, height=800)
+        )
+        app.paste_reply = lambda _reply: None
+        app.type_reply = lambda _reply: None
+        app.clicks = []
+        app.click_once = lambda point: app.clicks.append(point)
+        app.fallback_regular_like = (
+            lambda _scanner, _cycle, _line="", **_kwargs: False
+        )
+        app.skip_current_profile = lambda: True
+        app.log_prompt_failure = lambda batch, cycle, stage, error, skipped, recovery=None: {
+            "batch_id": batch,
+            "rotation": cycle,
+            "stage": stage,
+            "message": str(error),
+            "skipped": skipped,
+            "recovery": recovery,
+        }
+        return app
+
+    def make_scan(self):
+        prompt = CapturedPrompt(
+            "prompt-1",
+            "Together, we could",
+            "Win trivia night",
+            0,
+            0,
+            (100, 200),
+            0.95,
+        )
+        scan = ProfileScan((prompt,), 1, "fingerprint")
+        scanner = SimpleNamespace(
+            scan=lambda ensure_top=True: scan,
+            relocate=lambda _target: prompt,
+            reconfirm_visible=lambda _target: prompt,
+            center_target=lambda _target, relocated: relocated,
+        )
+        generator = SimpleNamespace(
+            generate=lambda _prompts, _tone: GeneratedReply(
+                "prompt-1",
+                "I bring facts and confidently wrong bonus-round guesses.",
+            )
+        )
+        return scan, scanner, generator
+
+    def test_closed_send_dialog_counts_as_success_when_prompt_card_remains_visible(self):
+        app = self.make_app()
+        scan, _scanner, _generator = self.make_scan()
+
+        with (
+            patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")),
+            patch("main_scoop.reply_is_visible_near", return_value=False),
+            patch("main_scoop.prompt_is_visible", return_value=True),
+        ):
+            outcome = app._classify_prompt_send_outcome(
+                object(),
+                [],
+                scan.prompts[0],
+                "A grounded reply",
+                (200, 500),
+                800,
+            )
+
+        self.assertEqual(outcome, "succeeded")
+
+    def test_comment_field_uses_send_button_geometry_when_placeholder_is_missed(self):
+        app = self.make_app()
+        capture = SimpleNamespace(
+            window=SimpleNamespace(left=100, top=50, width=400, height=700)
+        )
+        app.fresh_capture = lambda: capture
+        send_line = ScreenText("Send Priority Like", 0.96, 250, 620, 180, 30)
+
+        with patch("main_scoop.recognize_text", return_value=[send_line]):
+            point = app.wait_for_comment_field()
+
+        self.assertEqual(point, (300, send_line.center[1] - 59.5))
+
+    def test_five_profile_batch_drains_native_pool_after_every_profile(self):
+        app = self.make_app()
+        app.total_rotations = 5
+        app.make_profile_scanner = lambda _generator=None: object()
+        processed = []
+        pool_events = []
+
+        def process(_scanner, _generator, _tone, cycle, ensure_top):
+            processed.append((cycle, ensure_top))
+            # Stand in for temporary screenshot and OCR working buffers.
+            temporary_pixels = bytearray(8 * 1024 * 1024)
+            return f"reply-{cycle}-{len(temporary_pixels)}"
+
+        app._process_prompt_reply_profile = process
+
+        @contextmanager
+        def tracked_pool():
+            pool_events.append("enter")
+            try:
+                yield
+            finally:
+                pool_events.append("exit")
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=object()),
+            patch("main_scoop.native_autorelease_pool", tracked_pool),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(
+            processed,
+            [(1, True), (2, False), (3, False), (4, False), (5, False)],
+        )
+        self.assertEqual(pool_events, ["enter", "exit"] * 5)
+        self.assertEqual(app.last_prompt_batch["completed"], 5)
+
+    def test_failed_prompt_uses_qwen_first_photo_before_clicking_fallback(self):
+        app = self.make_app()
+        capture = make_capture(make_frame(400, 800, [], (25, 100, 180)))
+        heart_point = (300, 600)
+        app.fresh_capture = lambda: capture
+        app.heart_detector = SimpleNamespace(
+            find_all=lambda _capture, _platform: [(heart_point, 0.95)]
+        )
+        app.wait_for_comment_field = lambda attempts=3: None
+        scanner = SimpleNamespace(scroll_to_top=lambda: None)
+        photo_calls = []
+        generator = SimpleNamespace(
+            generate_photo_pickup_line=lambda image, tone: (
+                photo_calls.append((image, tone))
+                or "Does that surfboard come with lessons, or just confidence?"
+            )
+        )
+
+        with (
+            patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")),
+            patch("main_scoop.viewport_similarity", return_value=1.0),
+        ):
+            sent = ScoopUpApp.fallback_regular_like(
+                app,
+                scanner,
+                1,
+                photo_generator=generator,
+                tone="Playful & clean",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual(len(photo_calls), 1)
+        self.assertTrue(photo_calls[0][0].startswith(b"\x89PNG"))
+        self.assertEqual(photo_calls[0][1], "Playful & clean")
+        self.assertEqual(app.clicks.count(heart_point), 3)
+
+    def test_prompt_heart_uses_three_click_burst_and_relocates_before_retry(self):
+        app = self.make_app()
+        _scan, scanner, _generator = self.make_scan()
+        selected = scanner.scan().prompts[0]
+        app.wait_for_comment_field = lambda attempts=2: next(
+            app.comment_results
+        )
+        app.comment_results = iter([None, (300, 400)])
+        relocations = []
+        scanner.reconfirm_visible = lambda prompt: relocations.append(prompt) or selected
+
+        point = app.open_prompt_dialog(scanner, selected, selected)
+
+        self.assertEqual(point, (300, 400))
+        self.assertEqual(app.clicks.count(selected.heart_point), 6)
+        self.assertEqual(len(relocations), 1)
+
+    def test_dropped_paste_is_retried_until_composer_verifies(self):
+        app = self.make_app()
+        attempts = []
+        app.paste_reply = attempts.append
+        typed = []
+        app.type_reply = typed.append
+        capture = SimpleNamespace(window=SimpleNamespace(height=800))
+        app.verify_reply_entry = lambda *_args, **_kwargs: (capture, [])
+
+        with patch(
+            "main_scoop.reply_is_visible_near",
+            side_effect=[False, False, True],
+        ):
+            result_capture, _ = app.enter_reply(
+                (200, 500),
+                "A grounded reply",
+                800,
+            )
+
+        self.assertIs(result_capture, capture)
+        self.assertEqual(attempts, [])
+        self.assertEqual(typed, ["A grounded reply"] * 3)
+
+    def test_reply_verification_uses_short_waits_only_between_attempts(self):
+        app = self.make_app()
+        waits = []
+        app.interruptible_wait = waits.append
+        capture = SimpleNamespace(window=SimpleNamespace(height=800))
+        app.fresh_capture = lambda: capture
+
+        with (
+            patch("main_scoop.recognize_text", return_value=[]),
+            patch("main_scoop.reply_is_visible_near", return_value=False),
+        ):
+            app.verify_reply_entry(
+                "A grounded reply",
+                (200, 500),
+                800,
+                attempts=3,
+            )
+
+        self.assertEqual(waits, [0.15, 0.15])
+
+    def test_failed_text_verification_never_clicks_send(self):
+        app = self.make_app()
+        _scan, scanner, generator = self.make_scan()
+        app.make_profile_scanner = lambda _generator=None: scanner
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+        send_point = (250, 650)
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch("main_scoop.recognize_text", return_value=[comment_line]),
+            patch("main_scoop.prompt_is_visible", return_value=True),
+            patch("main_scoop.reply_is_visible_near", return_value=False),
+            patch(
+                "main_scoop.find_send_priority_like",
+                return_value=(send_point, 0.95, "Send Like"),
+            ),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        # Send detection is allowed for safe layout positioning, but no Send
+        # coordinate may be clicked when reply verification fails.
+        self.assertNotIn(send_point, app.clicks)
+        self.assertEqual(
+            app.clicks,
+            [
+                (100, 200),
+                (100, 200),
+                (100, 200),
+                comment_line.center,
+                comment_line.center,
+                comment_line.center,
+            ],
+        )
+        self.assertTrue(any("could not be verified" in status for status in app.statuses))
+
+    def test_unresponsive_send_is_retried_three_times_only_while_state_matches(self):
+        app = self.make_app()
+        _scan, scanner, generator = self.make_scan()
+        app.make_profile_scanner = lambda _generator=None: scanner
+        comment_line = ScreenText("Add a comment", 0.95, 10, 10, 100, 20)
+        entered_line = ScreenText("Verified funny reply", 0.95, 10, 50, 180, 20)
+        send_point = (250, 650)
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch(
+                "main_scoop.recognize_text",
+                return_value=[comment_line, entered_line],
+            ),
+            patch("main_scoop.prompt_is_visible", return_value=True),
+            patch("main_scoop.reply_is_visible_near", return_value=True),
+            patch(
+                "main_scoop.find_send_priority_like",
+                return_value=(send_point, 0.95, "Send Like"),
+            ),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(app.clicks.count(send_point), 3)
+        self.assertTrue(any("after 3 verified" in status for status in app.statuses))
+
+    def test_mismatched_open_dialog_never_pastes_or_sends(self):
+        app = self.make_app()
+        _scan, scanner, generator = self.make_scan()
+        app.make_profile_scanner = lambda _generator=None: scanner
+        pasted = []
+        app.paste_reply = pasted.append
+        comment_line = ScreenText("Add a comment", 0.95, 10, 10, 100, 20)
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch("main_scoop.recognize_text", return_value=[comment_line]),
+            patch("main_scoop.prompt_is_visible", return_value=False),
+            patch("main_scoop.find_send_priority_like") as find_send,
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(pasted, [])
+        find_send.assert_not_called()
+        self.assertTrue(any("did not match" in status for status in app.statuses))
+
+    def test_find_send_priority_like_reuses_provided_lines(self):
+        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        capture = SimpleNamespace()
+        with patch("main_scoop.recognize_text") as ocr:
+            point, score, text = find_send_priority_like(capture, [send_line])
+
+        ocr.assert_not_called()
+        self.assertEqual(point, send_line.center)
+        self.assertEqual(text, "Send Like")
+        self.assertGreaterEqual(score, 0.95)
+
+    def test_prompt_heart_burst_captures_once_before_clicks(self):
+        app = self.make_app()
+        _scan, scanner, _generator = self.make_scan()
+        selected = scanner.scan().prompts[0]
+        captures = []
+        capture = SimpleNamespace(
+            window=SimpleNamespace(left=0, top=0, width=400, height=800)
+        )
+        app.fresh_capture = lambda: captures.append(capture) or capture
+        app.wait_for_comment_field = lambda attempts=2: (300, 400)
+
+        point = app.open_prompt_dialog(scanner, selected, selected)
+
+        self.assertEqual(point, (300, 400))
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(app.clicks.count(selected.heart_point), 3)
+
+    def test_send_succeeds_as_soon_as_dialog_disappears(self):
+        app = self.make_app()
+        _scan, scanner, generator = self.make_scan()
+        app.make_profile_scanner = lambda _generator=None: scanner
+        waits = []
+        app.interruptible_wait = lambda seconds: waits.append(seconds)
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+        entered_line = ScreenText(
+            "I bring facts and confidently wrong bonus-round guesses.",
+            0.95,
+            10,
+            50,
+            180,
+            20,
+        )
+        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        send_point = send_line.center
+
+        def recognize(_capture, _vision, accurate=True):
+            if send_point in app.clicks:
+                return []
+            return [comment_line, entered_line, send_line]
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch("main_scoop.recognize_text", side_effect=recognize),
+            patch(
+                "main_scoop.prompt_is_visible",
+                side_effect=lambda _lines, _selected: send_point not in app.clicks,
+            ),
+            patch(
+                "main_scoop.reply_is_visible_near",
+                side_effect=lambda *_args, **_kwargs: send_point not in app.clicks,
+            ),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(app.clicks.count(send_point), 1)
+        self.assertNotIn(1.1, waits)
+        self.assertTrue(any("sent" in status.lower() for status in app.statuses))
+
+    def test_generation_overlaps_centering_but_waits_before_heart_clicks(self):
+        app = self.make_app()
+        _scan, scanner, _generator = self.make_scan()
+        selected = scanner.scan().prompts[0]
+        app.make_profile_scanner = lambda _generator=None: scanner
+        order = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def generate(_prompts, _tone):
+            order.append("generate_start")
+            started.set()
+            self.assertTrue(release.wait(1))
+            order.append("generate_end")
+            return GeneratedReply(
+                "prompt-1",
+                "I bring facts and confidently wrong bonus-round guesses.",
+            )
+
+        generator = SimpleNamespace(generate=generate)
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+        entered_line = ScreenText(
+            "I bring facts and confidently wrong bonus-round guesses.",
+            0.95,
+            10,
+            50,
+            180,
+            20,
+        )
+        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        send_point = send_line.center
+
+        def center(_target, relocated):
+            self.assertTrue(started.wait(1))
+            order.append("center")
+            release.set()
+            return relocated
+
+        def click(point):
+            if point == selected.heart_point:
+                order.append("heart")
+            app.clicks.append(point)
+
+        def recognize(_capture, _vision, accurate=True):
+            if send_point in app.clicks:
+                return []
+            return [comment_line, entered_line, send_line]
+
+        scanner.center_target = center
+        app.click_once = click
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch("main_scoop.recognize_text", side_effect=recognize),
+            patch(
+                "main_scoop.prompt_is_visible",
+                side_effect=lambda _lines, _selected: send_point not in app.clicks,
+            ),
+            patch(
+                "main_scoop.reply_is_visible_near",
+                side_effect=lambda *_args, **_kwargs: send_point not in app.clicks,
+            ),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(order[0], "generate_start")
+        self.assertLess(order.index("center"), order.index("generate_end"))
+        self.assertLess(order.index("generate_end"), order.index("heart"))
+        self.assertEqual(app.clicks.count(send_point), 1)
 
 
 if __name__ == "__main__":
