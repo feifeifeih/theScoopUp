@@ -70,6 +70,13 @@ PHOTO_UNSAFE_PATTERNS = UNSAFE_PATTERNS + (
     r"\b(?:body|skin|ethnicity|race|religion|disability|disabled|weight)\b",
     r"\b(?:young|old|thin|curvy|muscular|handsome|beautiful|gorgeous|hot|sexy)\b",
 )
+GROUNDING_STOPWORDS = {
+    "about", "after", "again", "always", "could", "first", "from", "going",
+    "have", "into", "just", "like", "mine", "more", "really", "something",
+    "that", "their", "them", "then", "there", "these", "they", "thing",
+    "thinks", "this", "those", "together", "very", "what", "when", "where",
+    "which", "with", "would", "your",
+}
 PHOTO_PICKUP_SCHEMA = {
     "type": "object",
     "properties": {
@@ -146,15 +153,6 @@ def validate_photo_pickup_line(line, visual_detail):
             "The pickup line compared the profile owner to an animal or object."
         )
     return text
-
-
-GROUNDING_STOPWORDS = {
-    "about", "after", "again", "always", "could", "first", "from", "going",
-    "have", "into", "just", "like", "mine", "more", "really", "something",
-    "that", "their", "them", "then", "there", "these", "they", "thing",
-    "thinks", "this", "those", "together", "very", "what", "when", "where",
-    "which", "with", "would", "your",
-}
 
 
 def validate_reply(reply, prompt_ids):
@@ -299,6 +297,42 @@ REPLY_SCHEMA = {
 }
 
 
+def _generate_with_retries(
+    request,
+    prompts,
+    tone,
+    attempts,
+    retry_exceptions,
+    failure_prefix,
+):
+    if not prompts:
+        raise ReplyGenerationError("No profile prompts are available to generate from.")
+    prompt_ids = [prompt.prompt_id for prompt in prompts]
+    last_error = None
+    request_prompts = list(prompts)
+    reply = None
+    for _ in range(attempts):
+        try:
+            reply = bind_single_prompt_id(request(request_prompts, tone), prompts)
+            return validate_grounding(validate_reply(reply, prompt_ids), prompts)
+        except retry_exceptions as error:
+            last_error = error
+            if (
+                isinstance(error, ReplyGenerationError)
+                and "concrete word" in str(error)
+                and reply is not None
+            ):
+                selected = next(
+                    (prompt for prompt in prompts if prompt.prompt_id == reply.prompt_id),
+                    None,
+                )
+                if selected is not None:
+                    request_prompts = [selected]
+    if isinstance(last_error, ReplyGenerationError):
+        raise last_error
+    raise ReplyGenerationError(f"{failure_prefix}: {last_error}") from last_error
+
+
 class ReplyGenerator:
     def __init__(self, client=None, model=MODEL):
         if client is None:
@@ -340,31 +374,14 @@ class ReplyGenerator:
             raise ReplyGenerationError("OpenAI returned malformed structured output.") from error
 
     def generate(self, prompts, tone):
-        if not prompts:
-            raise ReplyGenerationError("No profile prompts are available to generate from.")
-        prompt_ids = [prompt.prompt_id for prompt in prompts]
-        last_error = None
-        request_prompts = list(prompts)
-        for _ in range(2):
-            try:
-                reply = bind_single_prompt_id(
-                    self._request(request_prompts, tone),
-                    prompts,
-                )
-                reply = validate_reply(reply, prompt_ids)
-                return validate_grounding(reply, prompts)
-            except Exception as error:
-                last_error = error
-                if isinstance(error, ReplyGenerationError) and "concrete word" in str(error):
-                    selected = next(
-                        (prompt for prompt in prompts if prompt.prompt_id == reply.prompt_id),
-                        None,
-                    )
-                    if selected is not None:
-                        request_prompts = [selected]
-        if isinstance(last_error, ReplyGenerationError):
-            raise last_error
-        raise ReplyGenerationError(f"OpenAI reply generation failed: {last_error}") from last_error
+        return _generate_with_retries(
+            self._request,
+            prompts,
+            tone,
+            attempts=2,
+            retry_exceptions=Exception,
+            failure_prefix="OpenAI reply generation failed",
+        )
 
 
 class OllamaReplyGenerator:
@@ -463,6 +480,42 @@ class OllamaReplyGenerator:
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise ReplyGenerationError("The local model returned malformed output.") from error
 
+    def _vision_chat(
+        self,
+        image_bytes,
+        prompt,
+        schema,
+        timeout,
+        temperature,
+        num_predict,
+        error_message="The local vision model returned malformed output.",
+    ):
+        result = self._json_request(
+            "/api/chat",
+            {
+                "model": self.model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": [base64.b64encode(image_bytes).decode("ascii")],
+                }],
+                "format": schema,
+                "think": False,
+                "stream": False,
+                "keep_alive": "10m",
+                "options": {
+                    "temperature": temperature,
+                    "num_ctx": 4096,
+                    "num_predict": num_predict,
+                },
+            },
+            timeout=timeout,
+        )
+        try:
+            return json.loads(result["message"]["content"])
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ReplyGenerationError(error_message) from error
+
     def _photo_request(self, image_bytes, tone):
         if tone not in TONE_INSTRUCTIONS:
             raise ReplyGenerationError("Choose a supported humor tone.")
@@ -482,33 +535,14 @@ class OllamaReplyGenerator:
             "The line must repeat at least one concrete word exactly from visual_detail, be "
             f"ASCII, one line, and at most {MAX_REPLY_LENGTH} characters."
         )
-        result = self._json_request(
-            "/api/chat",
-            {
-                "model": self.model,
-                "messages": [{
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image_bytes).decode("ascii")],
-                }],
-                "format": PHOTO_PICKUP_SCHEMA,
-                "think": False,
-                "stream": False,
-                "keep_alive": "10m",
-                "options": {
-                    "temperature": 0.30,
-                    "num_ctx": 4096,
-                    "num_predict": 80,
-                },
-            },
+        return self._vision_chat(
+            image_bytes,
+            prompt,
+            PHOTO_PICKUP_SCHEMA,
             timeout=90,
+            temperature=0.30,
+            num_predict=80,
         )
-        try:
-            return json.loads(result["message"]["content"])
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ReplyGenerationError(
-                "The local vision model returned malformed output."
-            ) from error
 
     def detect_written_prompt(self, image_bytes):
         """Extract the first visible written Hinge prompt for deterministic anchoring."""
@@ -522,40 +556,27 @@ class OllamaReplyGenerator:
             "other non-written cards. If a complete heading and answer are not both visible, "
             "set has_written_prompt to false and return empty strings. Do not infer missing text."
         )
-        result = self._json_request(
-            "/api/chat",
-            {
-                "model": self.model,
-                "messages": [{
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image_bytes).decode("ascii")],
-                }],
-                "format": PROMPT_VISION_SCHEMA,
-                "think": False,
-                "stream": False,
-                "keep_alive": "10m",
-                "options": {
-                    "temperature": 0.10,
-                    "num_ctx": 4096,
-                    "num_predict": 120,
-                },
-            },
+        payload = self._vision_chat(
+            bytes(image_bytes),
+            prompt,
+            PROMPT_VISION_SCHEMA,
             timeout=60,
+            temperature=0.10,
+            num_predict=120,
+            error_message="The local vision model returned malformed prompt detection.",
         )
         try:
-            payload = json.loads(result["message"]["content"])
             if payload.get("has_written_prompt") is not True:
                 return None
             prompt_text = str(payload["prompt"]).strip()
             answer_text = str(payload["answer"]).strip()
-            if not prompt_text or not answer_text:
-                return None
-            return prompt_text, answer_text
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
+        except (KeyError, TypeError) as error:
             raise ReplyGenerationError(
                 "The local vision model returned malformed prompt detection."
             ) from error
+        if not prompt_text or not answer_text:
+            return None
+        return prompt_text, answer_text
 
     def generate_photo_pickup_line(self, image_bytes, tone):
         """Generate a locally grounded line from a cropped first-profile photo."""
@@ -584,28 +605,16 @@ class OllamaReplyGenerator:
         if not prompts:
             raise ReplyGenerationError("No profile prompts are available to generate from.")
         self.ensure_ready()
-        prompt_ids = [prompt.prompt_id for prompt in prompts]
-        last_error = None
-        request_prompts = list(prompts)
-        for _ in range(4):
-            try:
-                reply = bind_single_prompt_id(
-                    self._request(request_prompts, tone),
-                    prompts,
-                )
-                reply = validate_reply(reply, prompt_ids)
-                return validate_grounding(reply, prompts)
-            except (ReplyGenerationError, OSError, url_error.URLError) as error:
-                last_error = error
-                if isinstance(error, ReplyGenerationError) and "concrete word" in str(error):
-                    selected = next(
-                        (prompt for prompt in prompts if prompt.prompt_id == reply.prompt_id),
-                        None,
-                    )
-                    if selected is not None:
-                        request_prompts = [selected]
-        if isinstance(last_error, ReplyGenerationError):
-            if "concrete word" in str(last_error) and len(prompts) == 1:
+        try:
+            return _generate_with_retries(
+                self._request,
+                prompts,
+                tone,
+                attempts=4,
+                retry_exceptions=(ReplyGenerationError, OSError, url_error.URLError),
+                failure_prefix="Local reply generation failed",
+            )
+        except ReplyGenerationError as error:
+            if "concrete word" in str(error) and len(prompts) == 1:
                 return grounded_fallback(prompts[0], tone)
-            raise last_error
-        raise ReplyGenerationError(f"Local reply generation failed: {last_error}") from last_error
+            raise

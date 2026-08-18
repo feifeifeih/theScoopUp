@@ -1,7 +1,6 @@
 import math
 import json
 import os
-import re
 import struct
 import sys
 import threading
@@ -20,6 +19,7 @@ from profile_reply import (
     ProfileScanError,
     ProfileScanner,
     find_text_target,
+    normalize_text,
     prompt_is_visible,
     recognize_text,
     recover_vision_prompt_target,
@@ -408,50 +408,7 @@ def _png_chunk(chunk_type, data):
     )
 
 
-def first_profile_photo_png(capture, heart_point, max_edge=768):
-    """Crop the first photo above its Hinge heart and encode it without disk I/O."""
-    frame = capture.frame
-    window = capture.window
-    heart_frame_y = (heart_point[1] - window.top) * capture.scale_y
-    left = round(frame.width * 0.05)
-    right = round(frame.width * 0.95)
-    top = round(frame.height * 0.12)
-    bottom = round(min(frame.height * 0.78, heart_frame_y - frame.height * 0.045))
-    crop_width = right - left
-    crop_height = bottom - top
-    if crop_width < 80 or crop_height < frame.height * 0.22:
-        raise ReplyGenerationError(
-            "The first profile photo was not sufficiently visible for a safe crop."
-        )
-
-    scale = min(1.0, max_edge / max(crop_width, crop_height))
-    output_width = max(1, round(crop_width * scale))
-    output_height = max(1, round(crop_height * scale))
-    rows = bytearray()
-    for output_y in range(output_height):
-        source_y = top + min(crop_height - 1, int(output_y / scale))
-        rows.append(0)  # PNG filter type: None
-        for output_x in range(output_width):
-            source_x = left + min(crop_width - 1, int(output_x / scale))
-            blue, green, red = frame.color_at(source_x, source_y)
-            rows.extend((red, green, blue))
-
-    header = struct.pack(">IIBBBBB", output_width, output_height, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _png_chunk(b"IHDR", header)
-        + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
-        + _png_chunk(b"IEND", b"")
-    )
-
-
-def prompt_viewport_png(capture, max_edge=1400):
-    """Encode the readable profile viewport for Qwen prompt rescue."""
-    frame = capture.frame
-    left = round(frame.width * 0.04)
-    right = round(frame.width * 0.96)
-    top = round(frame.height * 0.07)
-    bottom = round(frame.height * 0.91)
+def _encode_frame_region_png(frame, left, top, right, bottom, max_edge):
     crop_width = right - left
     crop_height = bottom - top
     scale = min(1.0, max_edge / max(crop_width, crop_height))
@@ -471,6 +428,35 @@ def prompt_viewport_png(capture, max_edge=1400):
         + _png_chunk(b"IHDR", header)
         + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
         + _png_chunk(b"IEND", b"")
+    )
+
+
+def first_profile_photo_png(capture, heart_point, max_edge=768):
+    """Crop the first photo above its Hinge heart and encode it without disk I/O."""
+    frame = capture.frame
+    window = capture.window
+    heart_frame_y = (heart_point[1] - window.top) * capture.scale_y
+    left = round(frame.width * 0.05)
+    right = round(frame.width * 0.95)
+    top = round(frame.height * 0.12)
+    bottom = round(min(frame.height * 0.78, heart_frame_y - frame.height * 0.045))
+    if right - left < 80 or bottom - top < frame.height * 0.22:
+        raise ReplyGenerationError(
+            "The first profile photo was not sufficiently visible for a safe crop."
+        )
+    return _encode_frame_region_png(frame, left, top, right, bottom, max_edge)
+
+
+def prompt_viewport_png(capture, max_edge=1400):
+    """Encode the readable profile viewport for Qwen prompt rescue."""
+    frame = capture.frame
+    return _encode_frame_region_png(
+        frame,
+        round(frame.width * 0.04),
+        round(frame.height * 0.07),
+        round(frame.width * 0.96),
+        round(frame.height * 0.91),
+        max_edge,
     )
 
 
@@ -567,52 +553,6 @@ class HeartIconDetector:
 
         geometry = max(filled_score, boundary_score)
         return 0.72 * geometry + 0.18 * symmetry + 0.10 * landmarks
-
-    @staticmethod
-    def hinge_button_score(points, bounds):
-        """Match Hinge's black circular button and its white heart cutout."""
-        left, top, width, height = bounds
-        size = len(HINGE_HEART_BUTTON_TEMPLATE)
-        dark_counts = [[0 for _ in range(size)] for _ in range(size)]
-        cell_totals = [[0 for _ in range(size)] for _ in range(size)]
-
-        for y in range(top, top + height):
-            row = min(size - 1, int((y - top) / height * size))
-            for x in range(left, left + width):
-                column = min(size - 1, int((x - left) / width * size))
-                cell_totals[row][column] += 1
-
-        for x, y in points:
-            column = min(size - 1, int((x - left) / width * size))
-            row = min(size - 1, int((y - top) / height * size))
-            dark_counts[row][column] += 1
-
-        matched_weight = 0.0
-        total_weight = 0.0
-        for row in range(size):
-            for column in range(size):
-                total = cell_totals[row][column]
-                if not total:
-                    continue
-                observed_dark = dark_counts[row][column] / total >= 0.45
-                expected_dark = HINGE_HEART_BUTTON_TEMPLATE[row][column] == "#"
-
-                # Light pixels well inside the circle form the white heart and
-                # are the most discriminating part of the control.
-                normalized_x = (column + 0.5) / size - 0.5
-                normalized_y = (row + 0.5) / size - 0.5
-                inside_circle = normalized_x ** 2 + normalized_y ** 2 < 0.19
-                if not expected_dark and inside_circle:
-                    weight = 5.0
-                elif expected_dark:
-                    weight = 1.0
-                else:
-                    weight = 0.4
-                total_weight += weight
-                if observed_dark == expected_dark:
-                    matched_weight += weight
-
-        return matched_weight / total_weight if total_weight else 0.0
 
     @staticmethod
     def hinge_patch_score(frame, left, top, size):
@@ -781,91 +721,61 @@ class HeartIconDetector:
                 if self._is_candidate_color(frame.color_at(capture_x, capture_y), platform):
                     mask[row_offset + local_x] = 1
 
-        # Connected-component traversal consumes its mask. Preserve the raw
-        # pixels for Hinge's sliding-template fallback.
-        template_mask = mask[:] if platform == "Hinge" else None
-
         candidates = []
-        # Hinge uses the raw sliding signature below because its black button
-        # frequently merges with dark profile imagery. Components remain useful
-        # for Tinder's isolated green heart.
-        component_height = mask_height if platform == "Tinder" else 0
-        for local_y in range(component_height):
-            for local_x in range(mask_width):
-                start_index = local_y * mask_width + local_x
-                if not mask[start_index]:
-                    continue
+        if platform == "Tinder":
+            for local_y in range(mask_height):
+                for local_x in range(mask_width):
+                    start_index = local_y * mask_width + local_x
+                    if not mask[start_index]:
+                        continue
 
-                stack = [(local_x, local_y)]
-                mask[start_index] = 0
-                points = []
-                min_x = max_x = local_x
-                min_y = max_y = local_y
+                    stack = [(local_x, local_y)]
+                    mask[start_index] = 0
+                    points = []
+                    min_x = max_x = local_x
+                    min_y = max_y = local_y
 
-                while stack:
-                    x, y = stack.pop()
-                    points.append((x, y))
-                    min_x, max_x = min(min_x, x), max(max_x, x)
-                    min_y, max_y = min(min_y, y), max(max_y, y)
-                    for dx, dy in (
-                        (-1, -1), (0, -1), (1, -1),
-                        (-1, 0), (1, 0),
-                        (-1, 1), (0, 1), (1, 1),
+                    while stack:
+                        x, y = stack.pop()
+                        points.append((x, y))
+                        min_x, max_x = min(min_x, x), max(max_x, x)
+                        min_y, max_y = min(min_y, y), max(max_y, y)
+                        for dx, dy in (
+                            (-1, -1), (0, -1), (1, -1),
+                            (-1, 0), (1, 0),
+                            (-1, 1), (0, 1), (1, 1),
+                        ):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < mask_width and 0 <= ny < mask_height:
+                                index = ny * mask_width + nx
+                                if mask[index]:
+                                    mask[index] = 0
+                                    stack.append((nx, ny))
+
+                    width = max_x - min_x + 1
+                    height = max_y - min_y + 1
+                    aspect = width / height
+                    if (
+                        width < 15 or height < 15
+                        or width > 180 or height > 180
+                        or not 0.62 <= aspect <= 1.48
+                        or len(points) < width + height
                     ):
-                        nx, ny = x + dx, y + dy
-                        if 0 <= nx < mask_width and 0 <= ny < mask_height:
-                            index = ny * mask_width + nx
-                            if mask[index]:
-                                mask[index] = 0
-                                stack.append((nx, ny))
+                        continue
 
-                width = max_x - min_x + 1
-                height = max_y - min_y + 1
-                minimum = 15 if platform == "Tinder" else 24
-                maximum = 180 if platform == "Tinder" else 150
-                aspect = width / height
-                valid_aspect = (
-                    0.62 <= aspect <= 1.48
-                    if platform == "Tinder"
-                    else 0.84 <= aspect <= 1.16
-                )
-                density = len(points) / (width * height)
-                if (
-                    width < minimum or height < minimum
-                    or width > maximum or height > maximum
-                    or not valid_aspect
-                    or len(points) < width + height
-                    or (platform == "Hinge" and not 0.52 <= density <= 0.88)
-                ):
-                    continue
+                    score = self.shape_score(points, (min_x, min_y, width, height))
+                    if score < threshold:
+                        continue
 
-                bounds = (min_x, min_y, width, height)
-                score = (
-                    self.shape_score(points, bounds)
-                    if platform == "Tinder"
-                    else self.hinge_button_score(points, bounds)
-                )
-                if score < threshold:
-                    continue
-
-                center_x = x_start + min_x + width / 2
-                center_y = y_start + min_y + height / 2
-                if platform == "Tinder":
+                    center_x = x_start + min_x + width / 2
+                    center_y = y_start + min_y + height / 2
                     # Prefer the familiar lower-center action row when shapes tie.
-                    position_bonus = max(
-                        0,
-                        0.08 - abs(center_x / capture_width - 0.5) * 0.08,
-                    )
-                    score += position_bonus
-                else:
-                    # Prefer a fully visible heart near the vertical center.
-                    score += max(0, 0.04 - abs(center_y / capture_height - 0.5) * 0.04)
-                candidates.append((score, center_x, center_y, bounds))
-
-        if platform == "Hinge":
+                    score += max(0, 0.08 - abs(center_x / capture_width - 0.5) * 0.08)
+                    candidates.append((score, center_x, center_y, None))
+        else:
             template_center, template_score = self.find_hinge_template(
                 frame,
-                template_mask,
+                mask,
                 mask_width,
                 mask_height,
                 x_start,
@@ -900,8 +810,24 @@ class HeartIconDetector:
         return candidates[0] if candidates else (None, 0.0)
 
 
-def _normalize_text(text):
-    return re.sub(r"[^a-z]+", " ", text.casefold()).strip()
+SEND_SETTLE_TIMEOUT = 1.1
+SEND_POLL_INTERVAL = 0.15
+SEND_LIKE_MIN_SCORE = 0.55
+COMPOSER_VERTICAL_RATIO = 0.085
+
+
+def comment_point_from_send(window, send_point):
+    return (
+        window.left + window.width * 0.50,
+        send_point[1] - window.height * COMPOSER_VERTICAL_RATIO,
+    )
+
+
+def send_point_from_comment(window, comment_point):
+    return (
+        window.left + window.width * 0.62,
+        comment_point[1] + window.height * COMPOSER_VERTICAL_RATIO,
+    )
 
 
 def is_safe_iphone_action_point(capture, point, *, bottom_limit=0.86):
@@ -914,17 +840,13 @@ def is_safe_iphone_action_point(capture, point, *, bottom_limit=0.86):
     return 0.04 <= relative_x <= 0.96 and 0.12 <= relative_y <= bottom_limit
 
 
-SEND_SETTLE_TIMEOUT = 1.1
-SEND_POLL_INTERVAL = 0.15
-
-
 def find_send_priority_like(capture, lines=None):
     """Use native macOS OCR to find Hinge's current confirmation button."""
     if lines is None:
         lines = recognize_text(capture, Vision)
     candidates = []
     for line in lines:
-        normalized = _normalize_text(line.text)
+        normalized = normalize_text(line.text)
         words = set(normalized.split())
         if {"send", "like"}.issubset(words):
             score = line.confidence + (0.25 if "priority" in words else 0)
@@ -1032,6 +954,9 @@ class ScoopUpApp:
         self.heart_detector = HeartIconDetector()
         self.is_running = False
         self.total_rotations = 20
+        self._prompt_stage = "unknown"
+        self._prompt_failure_can_skip = True
+        self.last_prompt_batch = None
 
         tk.Label(
             root,
@@ -1296,23 +1221,19 @@ class ScoopUpApp:
         point, score, label = find_send_priority_like(capture, lines)
         if (
             point is not None
-            and score >= 0.55
+            and score >= SEND_LIKE_MIN_SCORE
             and is_safe_iphone_action_point(capture, point)
         ):
             return point, score, label
         # Vision sometimes garbles the pale button label. Once the matching
         # dialog and composer text are independently verified, its control is
         # reliably the wide button immediately below the composer.
-        window = capture.window
-        fallback = (
-            window.left + window.width * 0.62,
-            comment_point[1] + window.height * 0.085,
-        )
+        fallback = send_point_from_comment(capture.window, comment_point)
         if is_safe_iphone_action_point(capture, fallback):
             return fallback, 0.60, "Send Like (verified layout)"
         return None, 0.0, ""
 
-    def position_open_dialog_safely(self, selected=None, attempts=7):
+    def position_open_dialog_safely(self, attempts=7):
         """Lift the expanded composer until Send Like is in the top 85%."""
         for attempt in range(1, attempts + 1):
             capture = self.fresh_capture()
@@ -1323,23 +1244,21 @@ class ScoopUpApp:
                 min_confidence=0.25,
             )
             raw_send, raw_score, _ = find_send_priority_like(capture, lines)
-            if comment_point is None and raw_send is not None and raw_score >= 0.55:
-                comment_point = (
-                    capture.window.left + capture.window.width * 0.50,
-                    raw_send[1] - capture.window.height * 0.085,
-                )
+            if (
+                comment_point is None
+                and raw_send is not None
+                and raw_score >= SEND_LIKE_MIN_SCORE
+            ):
+                comment_point = comment_point_from_send(capture.window, raw_send)
             candidate_send = raw_send
             candidate_score = raw_score
             if comment_point is not None and candidate_send is None:
-                candidate_send = (
-                    capture.window.left + capture.window.width * 0.62,
-                    comment_point[1] + capture.window.height * 0.085,
-                )
+                candidate_send = send_point_from_comment(capture.window, comment_point)
                 candidate_score = 0.60
             if (
                 comment_point is not None
                 and candidate_send is not None
-                and candidate_score >= 0.55
+                and candidate_score >= SEND_LIKE_MIN_SCORE
                 and is_safe_iphone_action_point(
                     capture,
                     candidate_send,
@@ -1408,19 +1327,12 @@ class ScoopUpApp:
                 lines,
                 ("Send Priority Like", "Send Like"),
             )
-            if send_point is not None and send_score >= 0.55:
+            if send_point is not None and send_score >= SEND_LIKE_MIN_SCORE:
                 # The send control positively identifies the Hinge like sheet.
                 # Its composer occupies the full-width box immediately above
                 # that control, even when its pale placeholder is not OCR'd.
+                composer_point = comment_point_from_send(capture.window, send_point)
                 window = capture.window
-                composer_point = (
-                    window.left + window.width * 0.50,
-                    # In the compact Hinge sheet the composer is immediately
-                    # above Send.  The previous 18% offset landed in the
-                    # suggestion chips, so text could paste successfully but
-                    # verification watched the wrong part of the screen.
-                    send_point[1] - window.height * 0.085,
-                )
                 if (
                     window.left < composer_point[0] < window.left + window.width
                     and window.top < composer_point[1] < window.top + window.height
@@ -1441,7 +1353,7 @@ class ScoopUpApp:
             self.interruptible_wait(0.25)
         return last_capture, last_lines
 
-    def open_prompt_dialog(self, scanner, selected, relocated, attempts=2):
+    def open_prompt_dialog(self, scanner, selected, relocated):
         """Click a verified prompt heart, then hand off to Send Like discovery."""
         current_target = relocated
         self.set_status("Opening selected prompt...")
@@ -1737,9 +1649,7 @@ class ScoopUpApp:
             )
         # Composer/Send Like often start below the viewport. Scroll them into
         # place before requiring OCR of the opened prompt.
-        dialog_capture, dialog_lines, comment_point = self.position_open_dialog_safely(
-            selected
-        )
+        dialog_capture, dialog_lines, comment_point = self.position_open_dialog_safely()
         if not prompt_is_visible(dialog_lines, selected):
             _capture, dialog_lines = self.wait_for_matching_prompt_dialog(selected)
             if not prompt_is_visible(dialog_lines, selected):
@@ -1750,7 +1660,6 @@ class ScoopUpApp:
         self._prompt_stage = "generate"
         self.set_status(f"Profile {cycle}: Send Like is positioned; finishing the reply...")
         generated = self._finish_reply_generation(generation, selected)
-        self._current_generated_reply = generated.reply
         self.set_status(
             f"Profile {cycle}: replying to {selected.prompt!r} with {generated.reply!r}"
         )
@@ -1810,7 +1719,7 @@ class ScoopUpApp:
                 current_lines,
                 comment_point,
             )
-            if send_point is None or send_score < 0.55:
+            if send_point is None or send_score < SEND_LIKE_MIN_SCORE:
                 raise ProfileScanError(
                     "The Send Like control was not confidently detected in the safe screen area; nothing was sent."
                 )
@@ -1826,10 +1735,6 @@ class ScoopUpApp:
             if outcome == "succeeded":
                 send_succeeded = True
                 break
-            if outcome == "unexpected":
-                raise ProfileScanError(
-                    "The send dialog changed unexpectedly; stopped without another click."
-                )
             if outcome == "uncertain":
                 raise ProfileScanError(
                     "The send state became uncertain; stopped without another click."
@@ -1871,6 +1776,15 @@ class ScoopUpApp:
             pass
         return record
 
+    def _hinge_hearts_in_band(self, capture, top=0.18, bottom=0.72):
+        window = capture.window
+        return [
+            (point, score)
+            for point, score in self.heart_detector.find_all(capture, "Hinge")
+            if top <= (point[1] - window.top) / window.height <= bottom
+            and score >= SEND_LIKE_MIN_SCORE
+        ]
+
     def fallback_regular_like(
         self,
         scanner,
@@ -1894,24 +1808,13 @@ class ScoopUpApp:
             # Remove any partially entered comment before leaving the failed
             # inline composer. This prevents a stale draft from being sent by
             # the regular-like fallback.
-            comment_point = (
-                capture.window.left + capture.window.width * 0.50,
-                send_point[1] - capture.window.height * 0.085,
-            )
-            self.click_once(comment_point)
+            self.click_once(comment_point_from_send(capture.window, send_point))
             self.interruptible_wait(0.25)
             self.clear_reply_field()
 
         scanner.scroll_to_top()
         capture = self.fresh_capture()
-        hearts = [
-            (point, score)
-            for point, score in self.heart_detector.find_all(capture, "Hinge")
-            if 0.18
-            <= (point[1] - capture.window.top) / capture.window.height
-            <= 0.72
-            and score >= 0.55
-        ]
+        hearts = self._hinge_hearts_in_band(capture)
         if not hearts:
             return False
         heart_point, _ = min(hearts, key=lambda item: item[0][1])
@@ -1945,14 +1848,7 @@ class ScoopUpApp:
             getattr(current_capture, "frame", None),
         ) < 0.90:
             return False
-        current_hearts = [
-            (point, score)
-            for point, score in self.heart_detector.find_all(current_capture, "Hinge")
-            if 0.18
-            <= (point[1] - current_capture.window.top) / current_capture.window.height
-            <= 0.72
-            and score >= 0.55
-        ]
+        current_hearts = self._hinge_hearts_in_band(current_capture)
         if not current_hearts:
             return False
         heart_point, _ = min(current_hearts, key=lambda item: item[0][1])
@@ -1998,7 +1894,7 @@ class ScoopUpApp:
                 dialog_lines,
                 comment_point,
             )
-            if send_point is None or send_score < 0.55:
+            if send_point is None or send_score < SEND_LIKE_MIN_SCORE:
                 return False
             self.set_status(
                 f"Profile {cycle}: sending pickup-line {detected_text} "
@@ -2109,11 +2005,7 @@ class ScoopUpApp:
                     skipped = False
                     fallback_sent = False
                     recovery = "uncertain_send"
-                    if self.is_running and getattr(
-                        self,
-                        "_prompt_failure_can_skip",
-                        True,
-                    ):
+                    if self.is_running and self._prompt_failure_can_skip:
                         with native_autorelease_pool():
                             fallback_sent = self.fallback_regular_like(
                                 scanner,
@@ -2132,7 +2024,7 @@ class ScoopUpApp:
                     record = self.log_prompt_failure(
                         batch_id,
                         cycle,
-                        getattr(self, "_prompt_stage", "unknown"),
+                        self._prompt_stage,
                         error,
                         skipped,
                         recovery,

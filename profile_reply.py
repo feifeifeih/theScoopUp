@@ -185,19 +185,19 @@ def recognize_text(capture, vision_module, accurate=True):
     return sorted(lines, key=lambda line: (line.top, line.left))
 
 
+def _frame_color_samples(frame):
+    """Sample a coarse color grid so photo-only viewports still have a signature."""
+    for row in range(1, 12):
+        for column in range(1, 8):
+            yield frame.color_at(frame.width * column / 8, frame.height * row / 12)
+
+
 def viewport_signature(lines, frame=None):
     normalized = [normalize_text(line.text) for line in lines if line.confidence >= MIN_OCR_CONFIDENCE]
     parts = [part for part in normalized if part]
     if frame is not None:
-        # Text-free photo regions still need to participate in scroll-state
-        # detection. A small color grid is enough to detect movement without
-        # retaining or transmitting a screenshot.
-        for row in range(1, 12):
-            for column in range(1, 8):
-                x = frame.width * column / 8
-                y = frame.height * row / 12
-                color = frame.color_at(x, y)
-                parts.append("".join(f"{channel // 32:x}" for channel in color))
+        for color in _frame_color_samples(frame):
+            parts.append("".join(f"{channel // 32:x}" for channel in color))
     payload = "|".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
@@ -212,23 +212,16 @@ def viewport_similarity(first_lines, first_frame, second_lines, second_frame):
         return text_score
     color_score = 0.0
     sample_count = 0
-    for row in range(1, 12):
-        for column in range(1, 8):
-            first_color = first_frame.color_at(
-                first_frame.width * column / 8,
-                first_frame.height * row / 12,
-            )
-            second_color = second_frame.color_at(
-                second_frame.width * column / 8,
-                second_frame.height * row / 12,
-            )
-            channel_difference = sum(
-                abs(first - second) for first, second in zip(first_color, second_color)
-            ) / (len(first_color) * 255)
-            color_score += 1 - channel_difference
-            sample_count += 1
-    color_score /= max(1, sample_count)
-    return 0.55 * text_score + 0.45 * color_score
+    for first_color, second_color in zip(
+        _frame_color_samples(first_frame),
+        _frame_color_samples(second_frame),
+    ):
+        channel_difference = sum(
+            abs(first - second) for first, second in zip(first_color, second_color)
+        ) / (len(first_color) * 255)
+        color_score += 1 - channel_difference
+        sample_count += 1
+    return 0.55 * text_score + 0.45 * (color_score / max(1, sample_count))
 
 
 def _is_ui_text(text):
@@ -372,6 +365,38 @@ def prompts_match(candidate, target):
     target_words = set(normalize_text(target.answer).split())
     answer_overlap = len(candidate_words & target_words) / max(1, len(target_words))
     return heading_similarity >= 0.88 and answer_overlap >= 0.40
+
+
+def _prompt_similarity(candidate, target):
+    return SequenceMatcher(
+        None,
+        normalize_text(candidate.combined_text),
+        normalize_text(target.combined_text),
+    ).ratio()
+
+
+def _matching_prompts(candidates, target):
+    matches = []
+    for candidate in candidates:
+        similarity = _prompt_similarity(candidate, target)
+        if (
+            candidate.prompt_id == target.prompt_id
+            or similarity >= 0.86
+            or prompts_match(candidate, target)
+        ):
+            matches.append((similarity, candidate))
+    matches.sort(key=lambda item: (item[0], item[1].confidence), reverse=True)
+    return matches
+
+
+def _unique_prompt_match(candidates, target):
+    """Return the best unique match for a selected prompt, or None."""
+    matches = _matching_prompts(candidates, target)
+    if not matches:
+        return None
+    if len(matches) > 1 and abs(matches[0][0] - matches[1][0]) < 0.03:
+        raise ProfileScanError("The selected prompt has an ambiguous heart target.")
+    return matches[0][1]
 
 
 def prompt_text_vertical_center(lines, target, window_height):
@@ -587,7 +612,23 @@ class ProfileScanner:
     def _current(self):
         capture = self.capture()
         lines = self.ocr(capture)
-        return capture, lines, viewport_signature(lines, getattr(capture, "frame", None))
+        return capture, lines
+
+    def _parse_viewport(self, viewport_index):
+        capture, lines = self._current()
+        hearts = self.find_hearts(capture)
+        candidates = prompts_from_viewport(
+            lines,
+            hearts,
+            viewport_index,
+            capture.window.height,
+            getattr(capture.window, "top", 0),
+        )
+        return capture, lines, hearts, candidates
+
+    def _rescue_viewport(self, capture, lines, hearts, viewport_index):
+        rescued = self.vision_rescue(capture, lines, hearts, viewport_index)
+        return [rescued] if rescued is not None else []
 
     def scroll_to_top(self):
         stable = 0
@@ -597,7 +638,7 @@ class ProfileScanner:
             if not self.is_running():
                 raise ProfileScanError("Profile scan stopped.")
             self.progress(f"Returning to the top ({attempt + 1}/{MAX_TOP_SCROLLS})...")
-            capture, lines, _ = self._current()
+            capture, lines = self._current()
             similarity = (
                 viewport_similarity(
                     previous_lines,
@@ -619,6 +660,17 @@ class ProfileScanner:
             self.wait(0.5)
         raise ProfileScanError("Could not reliably reach the top of the profile.")
 
+    def _same_viewport(self, previous_capture, previous_lines, capture, lines):
+        return (
+            previous_lines is not None
+            and viewport_similarity(
+                previous_lines,
+                getattr(previous_capture, "frame", None),
+                lines,
+                getattr(capture, "frame", None),
+            ) >= 0.94
+        )
+
     def scan(self, ensure_top=True):
         if ensure_top:
             self.scroll_to_top()
@@ -629,7 +681,7 @@ class ProfileScanner:
                 self.wait(0.22)
         scan_started = self.clock()
         prompts = []
-        signatures = []
+        viewport_count = 0
         previous_capture = None
         previous_lines = None
         no_new_content = 0
@@ -641,15 +693,7 @@ class ProfileScanner:
             self.progress(
                 f"Scanning profile viewport {viewport_index + 1}/{self.max_viewports}..."
             )
-            capture, lines, signature = self._current()
-            hearts = self.find_hearts(capture)
-            candidates = prompts_from_viewport(
-                lines,
-                hearts,
-                viewport_index,
-                capture.window.height,
-                getattr(capture.window, "top", 0),
-            )
+            capture, lines, hearts, candidates = self._parse_viewport(viewport_index)
             if (
                 not candidates
                 and self.vision_rescue is not None
@@ -660,32 +704,20 @@ class ProfileScanner:
                 self.progress(
                     f"Using local vision to rescue viewport {viewport_index + 1}..."
                 )
-                rescued = self.vision_rescue(
-                    capture,
-                    lines,
-                    hearts,
-                    viewport_index,
+                candidates = self._rescue_viewport(
+                    capture, lines, hearts, viewport_index
                 )
-                if rescued is not None:
-                    candidates = [rescued]
             before = len(prompts)
             prompts = merge_prompts(prompts, candidates)
-            signatures.append(signature)
+            viewport_count += 1
             if len(prompts) >= self.prompt_limit:
                 self.progress(
                     "Found the first written prompt; starting the reply workflow..."
                 )
                 break
-            repeated_view = (
-                previous_lines is not None
-                and viewport_similarity(
-                    previous_lines,
-                    getattr(previous_capture, "frame", None),
-                    lines,
-                    getattr(capture, "frame", None),
-                ) >= 0.94
-            )
-            if len(prompts) == before and repeated_view:
+            if len(prompts) == before and self._same_viewport(
+                previous_capture, previous_lines, capture, lines
+            ):
                 no_new_content += 1
             else:
                 no_new_content = 0
@@ -706,37 +738,23 @@ class ProfileScanner:
                 self.wait(remaining)
             if not self.is_running():
                 raise ProfileScanError("Profile scan stopped.")
-            viewport_index = len(signatures)
-            capture, lines, signature = self._current()
-            hearts = self.find_hearts(capture)
-            candidates = prompts_from_viewport(
-                lines,
-                hearts,
-                viewport_index,
-                capture.window.height,
-                getattr(capture.window, "top", 0),
-            )
+            capture, lines, hearts, candidates = self._parse_viewport(viewport_count)
             if not candidates:
                 self.progress(
                     "No prompt found by OCR after "
                     f"{self.vision_rescue_delay:g} seconds; using local vision..."
                 )
-                rescued = self.vision_rescue(
-                    capture,
-                    lines,
-                    hearts,
-                    viewport_index,
+                candidates = self._rescue_viewport(
+                    capture, lines, hearts, viewport_count
                 )
-                if rescued is not None:
-                    candidates = [rescued]
             prompts = merge_prompts(prompts, candidates)
-            signatures.append(signature)
+            viewport_count += 1
 
         if not prompts:
             raise ProfileScanError("No readable Hinge prompt and answer pairs were found.")
         fingerprint_payload = "|".join(sorted(prompt.prompt_id for prompt in prompts))
         fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()[:20]
-        return ProfileScan(tuple(prompts), len(signatures), fingerprint)
+        return ProfileScan(tuple(prompts), viewport_count, fingerprint)
 
     def relocate(self, target):
         """Re-find a selected prompt from fresh captures before allowing a click."""
@@ -745,42 +763,15 @@ class ProfileScanner:
         previous_lines = None
         unchanged_views = 0
         for viewport_index in range(self.max_viewports):
-            capture, lines, _ = self._current()
-            candidates = prompts_from_viewport(
-                lines,
-                self.find_hearts(capture),
-                viewport_index,
-                capture.window.height,
-                getattr(capture.window, "top", 0),
+            capture, lines, _hearts, candidates = self._parse_viewport(viewport_index)
+            match = _unique_prompt_match(candidates, target)
+            if match is not None:
+                return match
+            unchanged_views = (
+                unchanged_views + 1
+                if self._same_viewport(previous_capture, previous_lines, capture, lines)
+                else 0
             )
-            matches = []
-            for candidate in candidates:
-                similarity = SequenceMatcher(
-                    None,
-                    normalize_text(candidate.combined_text),
-                    normalize_text(target.combined_text),
-                ).ratio()
-                if (
-                    candidate.prompt_id == target.prompt_id
-                    or similarity >= 0.86
-                    or prompts_match(candidate, target)
-                ):
-                    matches.append((similarity, candidate))
-            if matches:
-                matches.sort(key=lambda item: (item[0], item[1].confidence), reverse=True)
-                if len(matches) > 1 and abs(matches[0][0] - matches[1][0]) < 0.03:
-                    raise ProfileScanError("The selected prompt has an ambiguous heart target.")
-                return matches[0][1]
-            repeated_view = (
-                previous_lines is not None
-                and viewport_similarity(
-                    previous_lines,
-                    getattr(previous_capture, "frame", None),
-                    lines,
-                    getattr(capture, "frame", None),
-                ) >= 0.94
-            )
-            unchanged_views = unchanged_views + 1 if repeated_view else 0
             if unchanged_views >= 2:
                 break
             previous_capture = capture
@@ -795,37 +786,12 @@ class ProfileScanner:
         for attempt in range(attempts):
             if not self.is_running():
                 raise ProfileScanError("Profile scan stopped.")
-            capture, lines, _ = self._current()
-            candidates = prompts_from_viewport(
-                lines,
-                self.find_hearts(capture),
-                target.viewport_index,
-                capture.window.height,
-                getattr(capture.window, "top", 0),
+            _capture, _lines, _hearts, candidates = self._parse_viewport(
+                target.viewport_index
             )
-            matches = []
-            for candidate in candidates:
-                similarity = SequenceMatcher(
-                    None,
-                    normalize_text(candidate.combined_text),
-                    normalize_text(target.combined_text),
-                ).ratio()
-                if (
-                    candidate.prompt_id == target.prompt_id
-                    or similarity >= 0.86
-                    or prompts_match(candidate, target)
-                ):
-                    matches.append((similarity, candidate))
-            if matches:
-                matches.sort(
-                    key=lambda item: (item[0], item[1].confidence),
-                    reverse=True,
-                )
-                if len(matches) > 1 and abs(matches[0][0] - matches[1][0]) < 0.03:
-                    raise ProfileScanError(
-                        "The selected prompt has an ambiguous heart target."
-                    )
-                return matches[0][1]
+            match = _unique_prompt_match(candidates, target)
+            if match is not None:
+                return match
             if attempt < attempts - 1:
                 self.wait(0.25)
         raise ProfileScanError(
@@ -837,9 +803,8 @@ class ProfileScanner:
         current = initial
         last_direction = "down_small"
         last_relative_y = None
-        capture = self.capture()
+        capture, _lines = self._current()
         window = capture.window
-        lines = self.ocr(capture)
         for _ in range(attempts):
             relative_y = (
                 (current.heart_point[1] - window.top) / window.height
@@ -860,36 +825,18 @@ class ProfileScanner:
             last_direction = direction
             self.scroll(direction)
             self.wait(0.18)
-            capture = self.capture()
-            window = capture.window
-            lines = self.ocr(capture)
-            candidates = prompts_from_viewport(
-                lines,
-                self.find_hearts(capture),
-                target.viewport_index,
-                capture.window.height,
-                getattr(capture.window, "top", 0),
+            capture, lines, hearts, candidates = self._parse_viewport(
+                target.viewport_index
             )
-            matches = []
-            for candidate in candidates:
-                similarity = SequenceMatcher(
-                    None,
-                    normalize_text(candidate.combined_text),
-                    normalize_text(target.combined_text),
-                ).ratio()
-                if (
-                    candidate.prompt_id == target.prompt_id
-                    or similarity >= 0.86
-                    or prompts_match(candidate, target)
-                ):
-                    matches.append((similarity, candidate))
+            window = capture.window
+            matches = _matching_prompts(candidates, target)
             if not matches:
                 observed = " ".join(normalize_text(line.text) for line in lines)
                 if normalize_text(target.prompt) in observed:
                     current = recover_visible_prompt_target(
                         target,
                         lines,
-                        self.find_hearts(capture),
+                        hearts,
                         target.viewport_index,
                         capture.window,
                     )
@@ -898,15 +845,15 @@ class ProfileScanner:
                 # scroll. Re-read in place before declaring the prompt lost.
                 try:
                     current = self.reconfirm_visible(target, attempts=2)
-                    capture = self.capture()
+                    capture, lines, hearts, _candidates = self._parse_viewport(
+                        target.viewport_index
+                    )
                     window = capture.window
-                    lines = self.ocr(capture)
                     continue
                 except ProfileScanError:
                     raise ProfileScanError(
                         "The selected prompt was lost while moving it to the screen center."
                     )
-            matches.sort(key=lambda item: (item[0], item[1].confidence), reverse=True)
             current = matches[0][1]
         raise ProfileScanError(
             "The selected prompt could not be centered safely away from iPhone navigation "

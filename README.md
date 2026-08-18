@@ -1,118 +1,110 @@
 # The Scoop UP
 
-**The Scoop UP** automates likes in Tinder and Hinge and can scan an entire Hinge profile, write a funny response to one profile prompt, verify it, and send it.
+A macOS helper that uses **iPhone Mirroring** to automate Hinge likes and optional prompt replies.
+
+**Current status:** **Hinge is the only supported, tested app.** A Tinder option still appears in the UI, but Tinder detection and clicking have **not** been checked or verified. Do not rely on Tinder mode.
 
 ---
 
-## System Requirements
+## Requirements
 
-- **MacOS (version 15 or later)**
-- **iPhone (iOS 18 or later)**
-- Uses Apple's **iPhone Mirroring** app to interact with your iPhone.
-
----
-
-## Important Note
-
-It is **strongly recommended** that you have a premium subscription to the dating app (with unlimited swipes/likes) for the script to perform effectively.
+- macOS 15 or later
+- iPhone running iOS 18 or later
+- Apple **iPhone Mirroring** (keep the window visible while the app runs)
+- Python 3.11+ recommended
+- A Hinge account. A premium / unlimited-likes subscription is strongly recommended.
 
 ---
 
-## How to Use
+## Install
 
-1. **Install dependencies:**
+```bash
+git clone https://github.com/YOUR_USERNAME/theScoopUp.git
+cd theScoopUp
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-   ```bash
-   cd /Users/fei/Desktop/SideProject/theScoopUp
-   source myenv/bin/activate
-   python -m pip install -r requirements.txt
-   ```
+### Optional: local replies (no API key)
 
-   Prompt Reply defaults to **Local — Free**, which uses Ollama and does not need an API key or send profile text over the internet. Install the local runtime and model once if they are not already present:
+Prompt Reply defaults to **Local — Free**, which uses [Ollama](https://ollama.com/download) on your Mac. Profile text stays on this computer.
 
-   ```bash
-   brew install ollama
-   ollama pull qwen3.5:9b
-   ```
+```bash
+brew install ollama
+ollama pull qwen3.5:9b
+```
 
-   The Scoop UP starts the local Ollama service automatically and warms it when Prompt Reply starts. The model requires about 6.6 GB of disk space and may take 20–40 seconds to become ready on first launch.
+The model needs about 6.6 GB of disk space. The first launch can take 20–40 seconds. The Scoop UP starts Ollama automatically if it is installed.
 
-   The optional **OpenAI API** engine requires a paid API account and key:
+### Optional: OpenAI replies
 
-   ```bash
-   export OPENAI_API_KEY="your-api-key"
-   ```
+Set a key only if you choose **OpenAI API** in the app:
 
-   Add that export to your shell profile if you want it available every time you launch the app from Terminal. Never commit the key to this repository.
+```bash
+export OPENAI_API_KEY="your-api-key"
+```
 
-2. **Open iPhone Mirroring:**
-   Connect the iPhone, open Tinder or Hinge, and keep the iPhone Mirroring window visible.
+Never commit this key. The OpenAI engine sends recognized prompt/answer text only — not photos or screenshots.
 
-3. **Launch The Scoop UP:**
+---
+
+## Run
+
+1. Connect your iPhone, open **iPhone Mirroring**, and open **Hinge**. Keep that window on screen.
+2. Launch the app:
 
    ```bash
    python main_scoop.py
    ```
 
-   Local — Free mode can be opened normally from `dist/The Scoop UP V1.0.0.app`. If you select OpenAI API, launch the standalone build from a terminal so it receives the key:
+3. On first use, allow **Terminal** or **Python** under:
+   - **System Settings → Privacy & Security → Accessibility**
+   - **System Settings → Privacy & Security → Screen & System Audio Recording**
 
-   ```bash
-   OPENAI_API_KEY="your-api-key" \
-     "dist/The Scoop UP V1.0.0.app/Contents/MacOS/The Scoop UP V1.0.0"
-   ```
+   Then restart The Scoop UP. If capture is blocked, use **Open Screen Recording Settings** in the app.
 
-   Auto Like also does not need an API key.
+4. In the control panel:
+   - Dating app: **Hinge** (required for a working run)
+   - Workflow: **Auto Like** or **Prompt Reply**
+   - For Prompt Reply: reply engine and tone
+   - Number of rotations (Auto Like = like cycles; Prompt Reply = profiles)
 
-4. **Choose the App and Workflow:**
-   Select **Hinge** or **Tinder**, then choose one of these workflows:
-   - **Auto Like:** preserves the original automatic like behavior for either app.
-   - **Prompt Reply:** available for Hinge only. It jumps past the profile header, then uses fast native OCR first. If that cannot parse a viewport, `qwen3.5:9b` gets one bounded vision attempt to extract the first written prompt; native OCR and heart detection must still anchor the click target. It ignores non-written cards such as “Let's get together” and stops scanning as soon as the first valid written prompt is found. It generates a reply tied directly to that answer and sends it only after every verification passes. If prompt reply fails and the fallback field is blank, Qwen analyzes an in-memory crop of the first photo and generates a line grounded in a visible pet, activity, food, landmark, object, or setting. Unsafe, ungrounded, or unclear results fall back to the built-in clean list. A custom fallback line still overrides photo generation.
-
-5. **Choose a Reply Tone:**
-   Choose **Local — Free** or **OpenAI API**, then select **Playful & clean**, **Flirty & bold**, or **Dry & clever**. These settings are ignored by Auto Like.
-
-6. **Set Rotations:**
-   For Auto Like, rotations are action cycles. For Prompt Reply, rotations are profiles with one verified reply sent per profile.
-
-7. **Start the Automation:**
-   Click the **Start** button to begin the automated clicking process. The script will:
-   - Automatically locate the iPhone Mirroring window before every scan.
-   - **Tinder:** find the heart at its current position → click → wait 2 seconds → repeat.
-   - **Hinge:** scan for the white-heart/black-circle button for up to 2 seconds → when found, click it 3 times and wait 1 second for the UI → search for Send Priority Like for up to 2 seconds and click it 3 times when found. If the heart is missing, the app tries Send Like directly in case the confirmation UI is already open.
-   - Skip a click whenever its required visual target is not detected.
-   - **Hinge Prompt Reply:** scroll to the top for the first profile → jump to the likely prompt area → scan overlapping viewports only until the first valid written prompt is found → use Qwen vision once only when native parsing needs help → start generating a reply containing a concrete word from the answer while re-confirming and centering that prompt → wait for the generated reply before opening its heart → confirm the opened dialog matches that prompt → clear any preserved draft → retry paste and fall back to direct typing when Mirroring drops clipboard input → verify only inside the composer → click Send Like up to three times only while fresh captures prove the same verified dialog remains, using verified layout when its label OCR is garbled → poll until the dialog leaves instead of waiting a fixed 1.1 seconds → confirm that the dialog and profile changed.
-
-8. **Stop the Automation:**
-   Click **Stop** at any time. You can also press **Esc** while the control panel is focused.
-
-On first use, allow Terminal or Python under **System Settings → Privacy & Security → Accessibility** and **Screen & System Audio Recording**, then restart the program. If screen capture is blocked, the app displays an **Open Screen Recording Settings** button that opens the correct permissions page directly.
+5. Click **Start**. Click **Stop** or press **Esc** to halt.
 
 ---
 
-## Additional Information
+## Workflows (Hinge)
 
-- The script uses native macOS window metadata, ScreenCaptureKit capture, and Vision text recognition. Accurate OCR is used to parse prompts and verify replies; Fast OCR is used only to poll for Send Like and comment-field visibility. Captured pixels are copied into process-owned memory immediately so WindowServer image transports are not retained across profiles.
-- The OpenAI engine sends only locally recognized prompt/answer text to OpenAI. Profile photos and screenshots are not uploaded.
-- Local — Free sends prompt text only to the Ollama service on this Mac and requires no authentication.
-- Reply generation uses `gpt-5.6-luna` through the Responses API. API charges and account rate limits apply.
-- Replies are limited to 140 characters and validated locally. Generation is retried once, but a Send Like click is never retried when Hinge's resulting state is uncertain.
-- Prompt Reply never guesses at an unsafe target. When prompt handling fails before an uncertain send, it returns to the top and sends the user's validated custom pickup line—or a random built-in clean line when the field is blank—through the same entry, OCR, safe-position, and post-send checks. Uncertain send state still stops without another click.
-- The temporary clipboard content used for pasting is restored after the paste command.
-- Heart matching runs at native Retina capture resolution; only the final click point is converted to desktop coordinates.
-- A heart-analysis timeout is retried on the next cycle and is not treated as a completed “no heart” result.
-- Target detection runs again after every state-changing click; coordinates are never reused.
-- Heart and Send Priority Like clicks target the center of a positively detected visual target.
-- For any issues or further customization, please refer to the code comments for guidance.
+**Auto Like** finds Hinge’s like button, clicks it, then looks for **Send Like** / **Send Priority Like** and clicks that. If a target is not detected, that cycle is skipped.
 
-Happy swiping, and enjoy the time saved with The Scoop UP!
+**Prompt Reply** (Hinge only) finds the first written prompt on a profile, generates a short reply, pastes it only after on-screen verification, then sends. If prompt reply fails, it can fall back to a photo-grounded pickup line, a custom fallback line you typed, or a built-in clean line — then skip to the next profile when recovery fails.
+
+Reply tones: **Playful & clean**, **Flirty & bold**, **Dry & clever**. Replies are capped at 140 characters and checked locally before send.
 
 ---
 
-## Build the Standalone App
+## Build a standalone Mac app (optional)
 
 ```bash
-source myenv/bin/activate
+source .venv/bin/activate
 python -m PyInstaller --clean --noconfirm main_scoop.spec
 ```
 
-The reusable macOS application is created at `dist/The Scoop UP V1.0.0.app`.
+The app is written to `dist/The Scoop UP V1.0.0.app`.
+
+If you use OpenAI with the standalone build, launch it from Terminal so the key is available:
+
+```bash
+OPENAI_API_KEY="your-api-key" \
+  "dist/The Scoop UP V1.0.0.app/Contents/MacOS/The Scoop UP V1.0.0"
+```
+
+---
+
+## Notes
+
+- This tool drives the mirrored iPhone UI. Dating-app rules and account risk are your responsibility.
+- Captured screens stay in process memory for detection; they are not written to disk for Prompt Reply.
+- Local — Free talks only to Ollama on `127.0.0.1`. OpenAI is used only when that engine is selected.
+- Coordinates are never reused after a click. If a button or heart cannot be found, nothing is clicked.

@@ -15,14 +15,13 @@ from main_scoop import (
     SCREEN_RECORDING_SETTINGS_URL,
     ScoopUpApp,
     WindowCapture,
-    _normalize_text,
     _window_score,
     find_send_priority_like,
     format_elapsed_time,
     is_safe_iphone_action_point,
     first_profile_photo_png,
 )
-from profile_reply import CapturedPrompt, ProfileScan, ProfileScanError, ScreenText
+from profile_reply import CapturedPrompt, ProfileScan, ProfileScanError, ScreenText, normalize_text
 from reply_generation import GeneratedReply
 
 
@@ -177,8 +176,9 @@ class AutomaticDetectionTests(unittest.TestCase):
             for x in range(size)
             if (x - 35.5) ** 2 + (y - 35.5) ** 2 <= 35 ** 2
         ]
+        frame = make_frame(size, size, circle, (25, 25, 25))
         self.assertLess(
-            self.detector.hinge_button_score(circle, (0, 0, size, size)),
+            self.detector.hinge_patch_score(frame, 0, 0, size),
             0.84,
         )
 
@@ -194,7 +194,7 @@ class AutomaticDetectionTests(unittest.TestCase):
         self.assertLess(_window_score("iPhone Simulator", "", "", 430, 850), 0)
 
     def test_send_like_text_normalization(self):
-        self.assertEqual(_normalize_text("Send Priority Like!"), "send priority like")
+        self.assertEqual(normalize_text("Send Priority Like!"), "send priority like")
 
     def test_elapsed_time_is_compact_and_readable(self):
         self.assertEqual(format_elapsed_time(8.4), "8s")
@@ -319,6 +319,9 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         app = object.__new__(ScoopUpApp)
         app.is_running = True
         app.total_rotations = 1
+        app._prompt_stage = "unknown"
+        app._prompt_failure_can_skip = True
+        app.last_prompt_batch = None
         app.root = SimpleNamespace(after=lambda _delay, callback: callback())
         app.start_button = SimpleNamespace(config=lambda **_kwargs: None)
         app.statuses = []
