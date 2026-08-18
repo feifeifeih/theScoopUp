@@ -1442,50 +1442,44 @@ class ScoopUpApp:
         return last_capture, last_lines
 
     def open_prompt_dialog(self, scanner, selected, relocated, attempts=2):
-        """Open a verified prompt heart, retrying only while no dialog appears."""
+        """Click a verified prompt heart, then hand off to Send Like discovery."""
         current_target = relocated
-        for attempt in range(1, attempts + 1):
-            self.set_status(f"Opening selected prompt ({attempt}/{attempts})...")
-            # iPhone Mirroring occasionally drops individual taps. The heart
-            # target was freshly confirmed, so use the same short burst as the
-            # proven Auto Like workflow before re-reading the resulting state.
+        self.set_status("Opening selected prompt...")
+        # iPhone Mirroring occasionally drops individual taps. The heart
+        # target was freshly confirmed, so use the same short burst as the
+        # proven Auto Like workflow before re-reading the resulting state.
+        capture = self.fresh_capture()
+        if not is_safe_iphone_action_point(
+            capture,
+            current_target.heart_point,
+            bottom_limit=0.72,
+        ):
+            self.set_status(
+                "Prompt heart is in the bottom safe-zone margin; moving it upward..."
+            )
+            current_target = scanner.center_target(selected, current_target)
             capture = self.fresh_capture()
             if not is_safe_iphone_action_point(
                 capture,
                 current_target.heart_point,
                 bottom_limit=0.72,
             ):
-                self.set_status(
-                    "Prompt heart is in the bottom safe-zone margin; moving it upward..."
+                raise ProfileScanError(
+                    "The prompt heart could not be moved out of the iPhone home area; "
+                    "nothing was clicked."
                 )
-                current_target = scanner.center_target(selected, current_target)
-                capture = self.fresh_capture()
-                if not is_safe_iphone_action_point(
-                    capture,
-                    current_target.heart_point,
-                    bottom_limit=0.72,
-                ):
-                    raise ProfileScanError(
-                        "The prompt heart could not be moved out of the iPhone home area; "
-                        "nothing was clicked."
-                    )
-            for click_index in range(3):
-                self.click_once(current_target.heart_point)
-                if click_index < 2:
-                    self.interruptible_wait(0.15)
-            self.interruptible_wait(0.55)
-            if not self.is_running:
-                return None
-            comment_point = self.wait_for_comment_field(attempts=2)
-            if comment_point is not None:
-                return comment_point
-            if attempt < attempts:
-                current_target = scanner.reconfirm_visible(selected)
-                if current_target.confidence < 0.55:
-                    raise ProfileScanError(
-                        "The selected prompt could not be safely re-confirmed before retrying its heart."
-                    )
-        return None
+        for click_index in range(3):
+            self.click_once(current_target.heart_point)
+            if click_index < 2:
+                self.interruptible_wait(0.15)
+        self.interruptible_wait(0.55)
+        if not self.is_running:
+            return None
+        comment_point = self.wait_for_comment_field(attempts=2)
+        # The composer can begin below the viewport. Do not re-detect the
+        # original prompt underneath an opening like sheet; hand off to
+        # position_open_dialog_safely(), which scrolls until Send Like appears.
+        return comment_point
 
     def find_send_like_before(self, deadline):
         """Run one bounded OCR scan without leaving timed-out work behind."""
@@ -1668,11 +1662,10 @@ class ScoopUpApp:
         )
         prompt_visible = prompt_is_visible(lines, selected)
         if send_point is None:
-            # Hinge closes the composer after a successful send but can leave
-            # the replied-to prompt card visible on the underlying profile.
-            if not reply_visible:
-                return "succeeded"
-            return "unexpected"
+            # Hinge closes the composer after a successful send. Leftover OCR
+            # near the old composer, or the prompt card behind it, must not
+            # veto that close and abort the rest of the rotation batch.
+            return "succeeded"
         if reply_visible and prompt_visible:
             return "retry"
         return "uncertain"
@@ -1737,21 +1730,22 @@ class ScoopUpApp:
 
         self._prompt_stage = "open_dialog"
         self.set_status(f"Profile {cycle}: prompt heart detected; opening it now...")
-        comment_point = self.open_prompt_dialog(scanner, selected, selected)
-        if comment_point is None:
+        self.open_prompt_dialog(scanner, selected, selected)
+        if not self.is_running:
             raise ProfileScanError(
-                "The Hinge like dialog did not open after verified heart click bursts; nothing was sent."
+                "Prompt reply stopped before the like dialog could be positioned."
             )
-        initial_dialog_capture, initial_dialog_lines = self.wait_for_matching_prompt_dialog(
-            selected
-        )
-        if not prompt_is_visible(initial_dialog_lines, selected):
-            raise ProfileScanError(
-                "The opened Hinge dialog did not match the generated prompt; nothing was entered or sent."
-            )
+        # Composer/Send Like often start below the viewport. Scroll them into
+        # place before requiring OCR of the opened prompt.
         dialog_capture, dialog_lines, comment_point = self.position_open_dialog_safely(
             selected
         )
+        if not prompt_is_visible(dialog_lines, selected):
+            _capture, dialog_lines = self.wait_for_matching_prompt_dialog(selected)
+            if not prompt_is_visible(dialog_lines, selected):
+                raise ProfileScanError(
+                    "The opened Hinge dialog did not match the generated prompt; nothing was entered or sent."
+                )
 
         self._prompt_stage = "generate"
         self.set_status(f"Profile {cycle}: Send Like is positioned; finishing the reply...")
@@ -2036,21 +2030,27 @@ class ScoopUpApp:
                 return False
         return False
 
-    def skip_current_profile(self, attempts=2):
+    def skip_current_profile(self, attempts=3):
         """Dismiss an unsent sheet, verify Hinge's X, and confirm profile change."""
-        capture = self.fresh_capture()
-        skip_point, skip_score = find_hinge_skip_x(capture)
-        if skip_point is None and find_send_priority_like(capture)[0] is not None:
-            self.keyboard.press(Key.esc)
-            self.keyboard.release(Key.esc)
-            self.interruptible_wait(0.8)
-            capture = self.fresh_capture()
-
         for attempt in range(1, attempts + 1):
-            lines = recognize_text(capture, Vision)
-            skip_point, skip_score = find_hinge_skip_x(capture)
-            if skip_point is None or skip_score < 0.70:
+            if not self.is_running:
                 return False
+            capture = self.fresh_capture()
+            lines = recognize_text(capture, Vision)
+            send_point, _, _ = find_send_priority_like(capture, lines)
+            skip_point, skip_score = find_hinge_skip_x(capture)
+            if send_point is not None or skip_point is None or skip_score < 0.70:
+                self.set_status(
+                    f"Dismissing leftover like sheet before skip ({attempt}/{attempts})..."
+                )
+                self.keyboard.press(Key.esc)
+                self.keyboard.release(Key.esc)
+                self.interruptible_wait(0.5)
+                capture = self.fresh_capture()
+                lines = recognize_text(capture, Vision)
+                skip_point, skip_score = find_hinge_skip_x(capture)
+            if skip_point is None or skip_score < 0.70:
+                continue
             self.set_status(f"Skipping failed profile with verified X ({attempt}/{attempts})...")
             self.click_once(skip_point)
             self.interruptible_wait(1.2)
@@ -2065,7 +2065,6 @@ class ScoopUpApp:
             if similarity < 0.90:
                 self.interruptible_wait(0.45)
                 return True
-            capture = after_capture
         return False
 
     def run_prompt_reply(
@@ -2090,6 +2089,7 @@ class ScoopUpApp:
                 self.set_status("Warming up the local reply model...")
                 generator.ensure_ready()
             scanner = self.make_profile_scanner(generator)
+            rewind_next = False
             for cycle in range(1, self.total_rotations + 1):
                 if not self.is_running:
                     break
@@ -2101,7 +2101,7 @@ class ScoopUpApp:
                             generator,
                             tone,
                             cycle,
-                            ensure_top=(cycle == 1),
+                            ensure_top=(cycle == 1 or rewind_next),
                         )
                 except ScreenRecordingPermissionError:
                     raise
@@ -2145,19 +2145,15 @@ class ScoopUpApp:
                             if fallback_sent
                             else "Skipped; continuing."
                             if skipped
-                            else "Logged; continuing cautiously."
+                            else "Could not skip; continuing to the next rotation."
                         )
                     )
-                    if not fallback_sent and not skipped and getattr(
-                        self,
-                        "_prompt_failure_can_skip",
-                        True,
-                    ):
-                        break
+                    rewind_next = True
                     self.interruptible_wait(0.3)
                     continue
 
                 completed += 1
+                rewind_next = False
                 self.set_status(
                     f"Profile {cycle}: sent {reply!r}. Moving to the next profile..."
                 )

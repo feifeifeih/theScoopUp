@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import struct
 import threading
 import time
+from pynput.keyboard import Key
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ from main_scoop import (
     is_safe_iphone_action_point,
     first_profile_photo_png,
 )
-from profile_reply import CapturedPrompt, ProfileScan, ScreenText
+from profile_reply import CapturedPrompt, ProfileScan, ProfileScanError, ScreenText
 from reply_generation import GeneratedReply
 
 
@@ -389,6 +390,26 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(outcome, "succeeded")
 
+    def test_closed_send_dialog_counts_as_success_when_reply_ocr_lingers(self):
+        app = self.make_app()
+        scan, _scanner, _generator = self.make_scan()
+
+        with (
+            patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")),
+            patch("main_scoop.reply_is_visible_near", return_value=True),
+            patch("main_scoop.prompt_is_visible", return_value=True),
+        ):
+            outcome = app._classify_prompt_send_outcome(
+                object(),
+                [],
+                scan.prompts[0],
+                "A grounded reply",
+                (200, 500),
+                800,
+            )
+
+        self.assertEqual(outcome, "succeeded")
+
     def test_comment_field_uses_send_button_geometry_when_placeholder_is_missed(self):
         app = self.make_app()
         capture = SimpleNamespace(
@@ -474,22 +495,19 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(photo_calls[0][1], "Playful & clean")
         self.assertEqual(app.clicks.count(heart_point), 3)
 
-    def test_prompt_heart_uses_three_click_burst_and_relocates_before_retry(self):
+    def test_prompt_heart_hands_off_when_composer_starts_offscreen(self):
         app = self.make_app()
         _scan, scanner, _generator = self.make_scan()
         selected = scanner.scan().prompts[0]
-        app.wait_for_comment_field = lambda attempts=2: next(
-            app.comment_results
+        app.wait_for_comment_field = lambda attempts=2: None
+        scanner.reconfirm_visible = lambda _prompt: self.fail(
+            "prompt must not be re-detected after the heart click"
         )
-        app.comment_results = iter([None, (300, 400)])
-        relocations = []
-        scanner.reconfirm_visible = lambda prompt: relocations.append(prompt) or selected
 
         point = app.open_prompt_dialog(scanner, selected, selected)
 
-        self.assertEqual(point, (300, 400))
-        self.assertEqual(app.clicks.count(selected.heart_point), 6)
-        self.assertEqual(len(relocations), 1)
+        self.assertIsNone(point)
+        self.assertEqual(app.clicks.count(selected.heart_point), 3)
 
     def test_dropped_paste_is_retried_until_composer_verifies(self):
         app = self.make_app()
@@ -601,18 +619,22 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         app.make_profile_scanner = lambda _generator=None: scanner
         pasted = []
         app.paste_reply = pasted.append
-        comment_line = ScreenText("Add a comment", 0.95, 10, 10, 100, 20)
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+        send_line = ScreenText("Send Like", 0.95, 220, 500, 160, 28)
+        send_point = send_line.center
 
         with (
             patch("main_scoop.ReplyGenerator", return_value=generator),
-            patch("main_scoop.recognize_text", return_value=[comment_line]),
+            patch(
+                "main_scoop.recognize_text",
+                return_value=[comment_line, send_line],
+            ),
             patch("main_scoop.prompt_is_visible", return_value=False),
-            patch("main_scoop.find_send_priority_like") as find_send,
         ):
             app.run_prompt_reply("Playful & clean")
 
         self.assertEqual(pasted, [])
-        find_send.assert_not_called()
+        self.assertNotIn(send_point, app.clicks)
         self.assertTrue(any("did not match" in status for status in app.statuses))
 
     def test_find_send_priority_like_reuses_provided_lines(self):
@@ -802,6 +824,98 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(order[0], "generate_start")
         self.assertLess(order.index("heart"), order.index("generate_end"))
         self.assertEqual(app.clicks.count(send_point), 1)
+
+    def test_offscreen_composer_still_sends_after_heart_click(self):
+        app = self.make_app()
+        _scan, scanner, generator = self.make_scan()
+        app.make_profile_scanner = lambda _generator=None: scanner
+        app.open_prompt_dialog = lambda *_args, **_kwargs: None
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+        entered_line = ScreenText(
+            "I bring facts and confidently wrong bonus-round guesses.",
+            0.95,
+            10,
+            50,
+            180,
+            20,
+        )
+        send_line = ScreenText("Send Like", 0.95, 220, 500, 160, 28)
+        send_point = send_line.center
+
+        def recognize(_capture, _vision, accurate=True):
+            if send_point in app.clicks:
+                return []
+            return [comment_line, entered_line, send_line]
+
+        with (
+            patch("main_scoop.ReplyGenerator", return_value=generator),
+            patch("main_scoop.recognize_text", side_effect=recognize),
+            patch("main_scoop.prompt_is_visible", return_value=True),
+            patch(
+                "main_scoop.reply_is_visible_near",
+                side_effect=lambda *_args, **_kwargs: send_point not in app.clicks,
+            ),
+        ):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(app.clicks.count(send_point), 1)
+        self.assertTrue(any("sent" in status.lower() for status in app.statuses))
+
+    def test_batch_continues_all_rotations_when_skip_fails(self):
+        app = self.make_app()
+        app.total_rotations = 6
+        processed = []
+        app.make_profile_scanner = lambda _generator=None: object()
+        app.skip_current_profile = lambda: False
+
+        def process(_scanner, _generator, _tone, cycle, ensure_top):
+            processed.append((cycle, ensure_top))
+            raise ProfileScanError("prompt heart was covered by the like sheet")
+
+        app._process_prompt_reply_profile = process
+
+        with patch("main_scoop.ReplyGenerator", return_value=object()):
+            app.run_prompt_reply("Playful & clean")
+
+        self.assertEqual(
+            processed,
+            [(1, True), (2, True), (3, True), (4, True), (5, True), (6, True)],
+        )
+        self.assertEqual(app.last_prompt_batch["attempted"], 6)
+        self.assertEqual(app.last_prompt_batch["completed"], 0)
+
+    def test_skip_dismisses_sheet_when_send_like_is_offscreen(self):
+        app = self.make_app()
+        presses = []
+        releases = []
+        app.keyboard = SimpleNamespace(
+            press=presses.append,
+            release=releases.append,
+        )
+        skip_point = (40, 720)
+        capture = SimpleNamespace(
+            window=SimpleNamespace(left=0, top=0, width=400, height=800),
+            frame=None,
+        )
+        app.fresh_capture = lambda: capture
+        skip_lookups = [None, skip_point]
+
+        def find_skip(_capture):
+            point = skip_lookups.pop(0) if skip_lookups else skip_point
+            return (None, 0.0) if point is None else (point, 0.92)
+
+        with (
+            patch("main_scoop.recognize_text", return_value=[]),
+            patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")),
+            patch("main_scoop.find_hinge_skip_x", side_effect=find_skip),
+            patch("main_scoop.viewport_similarity", return_value=0.2),
+        ):
+            skipped = ScoopUpApp.skip_current_profile(app)
+
+        self.assertTrue(skipped)
+        self.assertEqual(presses, [Key.esc])
+        self.assertEqual(releases, [Key.esc])
+        self.assertEqual(app.clicks, [skip_point])
 
 
 if __name__ == "__main__":
