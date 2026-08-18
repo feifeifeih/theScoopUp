@@ -562,9 +562,9 @@ class ProfileScannerTests(unittest.TestCase):
 
         centered = scanner.center_target(initial, initial)
 
-        self.assertEqual(centered.heart_point[1], 400)
-        self.assertEqual(offset, 3)
-        self.assertEqual(capture_calls, 4)
+        self.assertEqual(centered.heart_point[1], 500)
+        self.assertEqual(offset, 2)
+        self.assertEqual(capture_calls, 3)
 
     def test_centering_uses_only_small_nudges_to_keep_prompt_visible(self):
         capture = SimpleNamespace(window=SimpleNamespace(top=0, height=800))
@@ -619,6 +619,50 @@ class ProfileScannerTests(unittest.TestCase):
         centered = scanner.center_target(initial, initial)
 
         self.assertEqual(centered, initial)
+        self.assertEqual(scrolls, [])
+
+    def test_prompt_in_top_thirty_percent_is_not_scrolled(self):
+        capture = SimpleNamespace(window=SimpleNamespace(top=0, height=800))
+        lines = [
+            line("My simple pleasures", 100, height=14),
+            line("Coffee before talking", 140, height=27),
+        ]
+        hearts = [((390, 240), 0.95)]
+        scrolls = []
+        scanner = ProfileScanner(
+            lambda: capture,
+            lambda _capture: lines,
+            lambda _capture: hearts,
+            scrolls.append,
+            lambda _seconds: None,
+        )
+        initial = prompts_from_viewport(lines, hearts, 0, 800)[0]
+
+        centered = scanner.center_target(initial, initial)
+
+        self.assertEqual(centered, initial)
+        self.assertEqual(scrolls, [])
+
+    def test_safe_heart_is_not_scrolled_when_heading_ocr_temporarily_misses(self):
+        capture = SimpleNamespace(window=SimpleNamespace(top=0, height=800))
+        initial_lines = [
+            line("My simple pleasures", 100, height=14),
+            line("Coffee before talking", 140, height=27),
+        ]
+        hearts = [((390, 240), 0.95)]
+        initial = prompts_from_viewport(initial_lines, hearts, 0, 800)[0]
+        scrolls = []
+        scanner = ProfileScanner(
+            lambda: capture,
+            lambda _capture: [],
+            lambda _capture: hearts,
+            scrolls.append,
+            lambda _seconds: None,
+        )
+
+        positioned = scanner.center_target(initial, initial)
+
+        self.assertEqual(positioned, initial)
         self.assertEqual(scrolls, [])
 
     def test_fast_ocr_disables_language_correction(self):

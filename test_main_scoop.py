@@ -539,7 +539,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         _scan, scanner, generator = self.make_scan()
         app.make_profile_scanner = lambda _generator=None: scanner
         comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
-        send_point = (250, 650)
+        send_point = (250, 520)
 
         with (
             patch("main_scoop.ReplyGenerator", return_value=generator),
@@ -575,7 +575,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         app.make_profile_scanner = lambda _generator=None: scanner
         comment_line = ScreenText("Add a comment", 0.95, 10, 10, 100, 20)
         entered_line = ScreenText("Verified funny reply", 0.95, 10, 50, 180, 20)
-        send_point = (250, 650)
+        send_point = (250, 520)
 
         with (
             patch("main_scoop.ReplyGenerator", return_value=generator),
@@ -616,7 +616,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertTrue(any("did not match" in status for status in app.statuses))
 
     def test_find_send_priority_like_reuses_provided_lines(self):
-        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        send_line = ScreenText("Send Like", 0.95, 220, 500, 160, 28)
         capture = SimpleNamespace()
         with patch("main_scoop.recognize_text") as ocr:
             point, score, text = find_send_priority_like(capture, [send_line])
@@ -625,6 +625,28 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(point, send_line.center)
         self.assertEqual(text, "Send Like")
         self.assertGreaterEqual(score, 0.95)
+
+    def test_open_dialog_scrolls_until_send_like_reaches_top_eighty_five_percent(self):
+        app = self.make_app()
+        scrolls = []
+        waits = []
+        app.interruptible_wait = waits.append
+        app.scroll_profile = lambda direction: scrolls.append(direction)
+        comment_line = ScreenText("Add a comment", 0.95, 100, 430, 200, 40)
+
+        def recognize(_capture, _vision, accurate=True):
+            send_top = 736 - len(scrolls) * 100
+            return [
+                comment_line,
+                ScreenText("Send Like", 0.95, 220, send_top, 160, 28),
+            ]
+
+        with patch("main_scoop.recognize_text", side_effect=recognize):
+            _capture, _lines, comment_point = app.position_open_dialog_safely()
+
+        self.assertEqual(comment_point, comment_line.center)
+        self.assertEqual(scrolls, ["down_small"])
+        self.assertEqual(waits, [0.18])
 
     def test_prompt_heart_burst_captures_once_before_clicks(self):
         app = self.make_app()
@@ -643,6 +665,41 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(len(captures), 1)
         self.assertEqual(app.clicks.count(selected.heart_point), 3)
 
+    def test_prompt_heart_is_moved_only_when_below_safe_click_area(self):
+        app = self.make_app()
+        _scan, scanner, _generator = self.make_scan()
+        selected = scanner.scan().prompts[0]
+        unsafe = CapturedPrompt(
+            selected.prompt_id,
+            selected.prompt,
+            selected.answer,
+            selected.viewport_index,
+            selected.scroll_steps,
+            (selected.heart_point[0], 700),
+            selected.confidence,
+        )
+        moved = CapturedPrompt(
+            selected.prompt_id,
+            selected.prompt,
+            selected.answer,
+            selected.viewport_index,
+            selected.scroll_steps,
+            (selected.heart_point[0], 500),
+            selected.confidence,
+        )
+        adjustments = []
+        scanner.center_target = (
+            lambda target, current: adjustments.append((target, current)) or moved
+        )
+        app.wait_for_comment_field = lambda attempts=2: (300, 400)
+
+        point = app.open_prompt_dialog(scanner, selected, unsafe)
+
+        self.assertEqual(point, (300, 400))
+        self.assertEqual(adjustments, [(selected, unsafe)])
+        self.assertEqual(app.clicks.count(unsafe.heart_point), 0)
+        self.assertEqual(app.clicks.count(moved.heart_point), 3)
+
     def test_send_succeeds_as_soon_as_dialog_disappears(self):
         app = self.make_app()
         _scan, scanner, generator = self.make_scan()
@@ -658,7 +715,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
             180,
             20,
         )
-        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        send_line = ScreenText("Send Like", 0.95, 220, 500, 160, 28)
         send_point = send_line.center
 
         def recognize(_capture, _vision, accurate=True):
@@ -684,7 +741,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertNotIn(1.1, waits)
         self.assertTrue(any("sent" in status.lower() for status in app.statuses))
 
-    def test_generation_overlaps_centering_but_waits_before_heart_clicks(self):
+    def test_prompt_heart_is_clicked_before_generation_finishes(self):
         app = self.make_app()
         _scan, scanner, _generator = self.make_scan()
         selected = scanner.scan().prompts[0]
@@ -713,18 +770,13 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
             180,
             20,
         )
-        send_line = ScreenText("Send Like", 0.95, 220, 620, 160, 28)
+        send_line = ScreenText("Send Like", 0.95, 220, 500, 160, 28)
         send_point = send_line.center
-
-        def center(_target, relocated):
-            self.assertTrue(started.wait(1))
-            order.append("center")
-            release.set()
-            return relocated
 
         def click(point):
             if point == selected.heart_point:
                 order.append("heart")
+                release.set()
             app.clicks.append(point)
 
         def recognize(_capture, _vision, accurate=True):
@@ -732,7 +784,6 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
                 return []
             return [comment_line, entered_line, send_line]
 
-        scanner.center_target = center
         app.click_once = click
         with (
             patch("main_scoop.ReplyGenerator", return_value=generator),
@@ -749,8 +800,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
             app.run_prompt_reply("Playful & clean")
 
         self.assertEqual(order[0], "generate_start")
-        self.assertLess(order.index("center"), order.index("generate_end"))
-        self.assertLess(order.index("generate_end"), order.index("heart"))
+        self.assertLess(order.index("heart"), order.index("generate_end"))
         self.assertEqual(app.clicks.count(send_point), 1)
 
 

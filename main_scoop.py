@@ -1313,7 +1313,7 @@ class ScoopUpApp:
         return None, 0.0, ""
 
     def position_open_dialog_safely(self, selected=None, attempts=7):
-        """Lift an expanded Hinge composer until Send is clear of Home."""
+        """Lift the expanded composer until Send Like is in the top 85%."""
         for attempt in range(1, attempts + 1):
             capture = self.fresh_capture()
             lines = recognize_text(capture, Vision)
@@ -1343,19 +1343,18 @@ class ScoopUpApp:
                 and is_safe_iphone_action_point(
                     capture,
                     candidate_send,
-                    bottom_limit=0.82,
+                    bottom_limit=0.85,
                 )
-                and (selected is None or prompt_is_visible(lines, selected))
             ):
                 return capture, lines, comment_point
             if attempt < attempts:
                 self.set_status(
-                    f"Moving Send Like above the iPhone home area ({attempt}/{attempts})..."
+                    f"Moving Send Like into the top 85% ({attempt}/{attempts})..."
                 )
                 self.scroll_profile("down_small")
-                self.interruptible_wait(0.3)
+                self.interruptible_wait(0.18)
         raise ProfileScanError(
-            "Send Like could not be positioned safely above the iPhone home area; nothing was clicked."
+            "Send Like could not be moved into the top 85%; nothing was clicked."
         )
 
     def enter_reply(self, comment_point, reply, window_height, attempts=3):
@@ -1456,9 +1455,20 @@ class ScoopUpApp:
                 current_target.heart_point,
                 bottom_limit=0.72,
             ):
-                raise ProfileScanError(
-                    "The prompt heart was too close to the iPhone home area; nothing was clicked."
+                self.set_status(
+                    "Prompt heart is in the bottom safe-zone margin; moving it upward..."
                 )
+                current_target = scanner.center_target(selected, current_target)
+                capture = self.fresh_capture()
+                if not is_safe_iphone_action_point(
+                    capture,
+                    current_target.heart_point,
+                    bottom_limit=0.72,
+                ):
+                    raise ProfileScanError(
+                        "The prompt heart could not be moved out of the iPhone home area; "
+                        "nothing was clicked."
+                    )
             for click_index in range(3):
                 self.click_once(current_target.heart_point)
                 if click_index < 2:
@@ -1720,29 +1730,14 @@ class ScoopUpApp:
         )
         generation = self._start_reply_generation(generator, scan.prompts, tone)
 
-        self._prompt_stage = "reconfirm"
-        self.set_status(
-            f"Profile {cycle}: confirming the visible prompt without rewinding..."
-        )
-        relocated = scanner.reconfirm_visible(selected)
-        if relocated.confidence < 0.55:
+        if selected.confidence < 0.55:
             raise ProfileScanError(
                 "The selected prompt target was below the safe confidence threshold."
             )
 
-        self._prompt_stage = "center"
-        self.set_status(f"Profile {cycle}: centering the selected prompt safely...")
-        relocated = scanner.center_target(selected, relocated)
-
-        self._prompt_stage = "generate"
-        generated = self._finish_reply_generation(generation, selected)
-        self._current_generated_reply = generated.reply
-        self.set_status(
-            f"Profile {cycle}: replying to {selected.prompt!r} with {generated.reply!r}"
-        )
-
         self._prompt_stage = "open_dialog"
-        comment_point = self.open_prompt_dialog(scanner, selected, relocated)
+        self.set_status(f"Profile {cycle}: prompt heart detected; opening it now...")
+        comment_point = self.open_prompt_dialog(scanner, selected, selected)
         if comment_point is None:
             raise ProfileScanError(
                 "The Hinge like dialog did not open after verified heart click bursts; nothing was sent."
@@ -1756,6 +1751,14 @@ class ScoopUpApp:
             )
         dialog_capture, dialog_lines, comment_point = self.position_open_dialog_safely(
             selected
+        )
+
+        self._prompt_stage = "generate"
+        self.set_status(f"Profile {cycle}: Send Like is positioned; finishing the reply...")
+        generated = self._finish_reply_generation(generation, selected)
+        self._current_generated_reply = generated.reply
+        self.set_status(
+            f"Profile {cycle}: replying to {selected.prompt!r} with {generated.reply!r}"
         )
 
         self._prompt_stage = "enter_reply"

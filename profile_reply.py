@@ -847,27 +847,16 @@ class ProfileScanner:
                 else None
             )
             last_relative_y = relative_y
-            observed = " ".join(normalize_text(line.text) for line in lines)
-            heading_visible = normalize_text(target.prompt) in observed
             if (
                 current is not None
-                and heading_visible
                 and relative_y is not None
-                and 0.34 <= relative_y <= 0.60
+                and relative_y <= 0.70
             ):
                 return current
 
-            # A full scroll can move a short prompt completely out of the
-            # viewport before OCR has a chance to reacquire it. Centering is
-            # precision work, so always use a bounded nudge even when the
-            # heart starts near an edge.
-            direction = (
-                last_direction
-                if relative_y is None
-                else "down_small"
-                if relative_y > 0.47
-                else "up_small"
-            )
+            # Hearts in the top 70% are already safely tappable. Only nudge
+            # upward when the target sits in the bottom 30% near navigation.
+            direction = last_direction if relative_y is None else "down_small"
             last_direction = direction
             self.scroll(direction)
             self.wait(0.18)
