@@ -2,7 +2,7 @@
 
 **Version 2.0.0**
 
-A macOS helper that uses **iPhone Mirroring** to automate Hinge likes and optional prompt replies.
+A macOS helper that uses **iPhone Mirroring** to automate Hinge and Tinder likes and optional prompt replies.
 
 **Current status:** **Hinge is the only supported, tested app.** A Tinder option still appears in the UI, but Tinder detection and clicking have **not** been checked or verified. Do not rely on Tinder mode.
 
@@ -20,7 +20,7 @@ A macOS helper that uses **iPhone Mirroring** to automate Hinge likes and option
 
 ## Install
 
-clone this repo
+clone this repo then continue with the following steps
 ```bash
 cd theScoopUp
 python3 -m venv .venv
@@ -30,7 +30,7 @@ python -m pip install -r requirements.txt
 
 ### Free local LLM (recommended)
 
-Prompt Reply defaults to **Local — Free**. That uses [Ollama](https://ollama.com/download) on your Mac — no API key, and profile text stays on this computer.
+Prompt Reply defaults to **Local — Free**.
 
 The local model name lives in `reply_generation.py` as `LOCAL_FREE_MODEL`. This release prefers **qwen3.5:9b**.
 
