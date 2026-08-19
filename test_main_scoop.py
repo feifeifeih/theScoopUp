@@ -1,8 +1,10 @@
 import unittest
 from contextlib import contextmanager
+import os
 import struct
 import threading
 import time
+import tkinter as tk
 from pynput.keyboard import Key
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +13,7 @@ from main_scoop import (
     HeartIconDetector,
     HINGE_HEART_BUTTON_TEMPLATE,
     MirroringWindow,
+    PAID_MODEL_PROMPT,
     PixelFrame,
     SCREEN_RECORDING_SETTINGS_URL,
     ScoopUpApp,
@@ -20,9 +23,10 @@ from main_scoop import (
     format_elapsed_time,
     is_safe_iphone_action_point,
     first_profile_photo_png,
+    parse_openai_api_key,
 )
 from profile_reply import CapturedPrompt, ProfileScan, ProfileScanError, ScreenText, normalize_text
-from reply_generation import GeneratedReply
+from reply_generation import GeneratedReply, PAID_ENGINE, PAY_MODELS
 
 
 def make_frame(width, height, colored_points, color):
@@ -919,6 +923,65 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(presses, [Key.esc])
         self.assertEqual(releases, [Key.esc])
         self.assertEqual(app.clicks, [skip_point])
+
+
+class OpenAIApiKeyImportTests(unittest.TestCase):
+    def test_parse_reads_env_assignment_and_plain_key(self):
+        self.assertEqual(
+            parse_openai_api_key('export OPENAI_API_KEY="sk-test"\n'),
+            "sk-test",
+        )
+        self.assertEqual(parse_openai_api_key("sk-live-plain\n"), "sk-live-plain")
+        self.assertEqual(
+            parse_openai_api_key('ANTHROPIC_API_KEY="sk-ant-test"\n'),
+            "sk-ant-test",
+        )
+        self.assertEqual(parse_openai_api_key("# comment\n"), "")
+
+
+class PaidEngineUiTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "",
+                "ANTHROPIC_API_KEY": "",
+                "GEMINI_API_KEY": "",
+                "GOOGLE_API_KEY": "",
+                "XAI_API_KEY": "",
+                "DEEPSEEK_API_KEY": "",
+            },
+        )
+        self.env.start()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = ScoopUpApp(self.root)
+        self.root.update_idletasks()
+
+    def tearDown(self):
+        self.root.destroy()
+        self.env.stop()
+
+    def test_openai_asks_for_model_then_api_key(self):
+        self.assertFalse(self.app.paid_model_menu.winfo_manager())
+        self.assertFalse(self.app._api_key_row[1].winfo_manager())
+
+        self.app.engine_var.set(PAID_ENGINE)
+        self.root.update_idletasks()
+
+        self.assertTrue(self.app.paid_model_menu.winfo_manager())
+        self.assertFalse(self.app._api_key_row[1].winfo_manager())
+        self.assertEqual(self.app.paid_model_var.get(), PAID_MODEL_PROMPT)
+        self.assertIn("paid model", self.app.status_label.cget("text").lower())
+        self.assertIn("Claude Sonnet 4.6", PAY_MODELS)
+        self.assertIn("Gemini 2.5 Flash", PAY_MODELS)
+        self.assertIn("Grok 4", PAY_MODELS)
+
+        self.app.paid_model_var.set("Claude Sonnet 4.6")
+        self.root.update_idletasks()
+
+        self.assertTrue(self.app._api_key_row[1].winfo_manager())
+        self.assertIn("anthropic", self.app.status_label.cget("text").lower())
 
 
 if __name__ == "__main__":

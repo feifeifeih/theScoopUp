@@ -1,4 +1,4 @@
-"""OpenAI-backed, validated funny reply generation."""
+"""Paid and local validated funny reply generation."""
 
 from dataclasses import dataclass
 import base64
@@ -13,7 +13,47 @@ from urllib import error as url_error
 from urllib import request as url_request
 
 
-PAY_MODEL = "gpt-5.6-luna"
+@dataclass(frozen=True)
+class PaidModel:
+    label: str
+    provider: str
+    model_id: str
+    env_key: str
+
+    @property
+    def provider_title(self):
+        return {
+            "openai": "OpenAI",
+            "anthropic": "Anthropic",
+            "google": "Google",
+            "xai": "xAI",
+            "deepseek": "DeepSeek",
+        }[self.provider]
+
+
+PAID_MODELS = (
+    PaidModel("OpenAI gpt-5.6-luna", "openai", "gpt-5.6-luna", "OPENAI_API_KEY"),
+    PaidModel("OpenAI gpt-5", "openai", "gpt-5", "OPENAI_API_KEY"),
+    PaidModel("OpenAI gpt-5-mini", "openai", "gpt-5-mini", "OPENAI_API_KEY"),
+    PaidModel("OpenAI gpt-5-nano", "openai", "gpt-5-nano", "OPENAI_API_KEY"),
+    PaidModel("Claude Sonnet 4.6", "anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
+    PaidModel("Claude Haiku 4.5", "anthropic", "claude-haiku-4-5", "ANTHROPIC_API_KEY"),
+    PaidModel("Gemini 2.5 Flash", "google", "gemini-2.5-flash", "GEMINI_API_KEY"),
+    PaidModel("Gemini 2.5 Pro", "google", "gemini-2.5-pro", "GEMINI_API_KEY"),
+    PaidModel("Grok 4", "xai", "grok-4", "XAI_API_KEY"),
+    PaidModel("DeepSeek Chat", "deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
+)
+PAY_MODELS = tuple(model.label for model in PAID_MODELS)
+PAY_MODEL = PAID_MODELS[0].model_id
+PAID_ENGINE = "Paid API"
+API_KEY_ENV_NAMES = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "XAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
 LOCAL_FREE_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 MAX_REPLY_LENGTH = 140
@@ -104,7 +144,7 @@ PROMPT_VISION_SCHEMA = {
 
 
 def validate_fallback_pickup_line(line):
-    """Validate a user-entered fallback before it can reach Hinge."""
+    """Validate a fallback pickup line before it can reach Hinge."""
     if not isinstance(line, str):
         raise ReplyGenerationError("The fallback pickup line must be text.")
     text = line.strip()
@@ -333,12 +373,61 @@ def _generate_with_retries(
     raise ReplyGenerationError(f"{failure_prefix}: {last_error}") from last_error
 
 
+def paid_model_from_selection(value):
+    if not value:
+        return None
+    for model in PAID_MODELS:
+        if value in {model.label, model.model_id}:
+            return model
+    return None
+
+
+def parse_generated_reply(payload):
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ReplyGenerationError("The paid model returned malformed structured output.")
+        try:
+            payload = json.loads(text[start:end + 1])
+        except json.JSONDecodeError as error:
+            raise ReplyGenerationError(
+                "The paid model returned malformed structured output."
+            ) from error
+    try:
+        return GeneratedReply(str(payload["prompt_id"]), str(payload["reply"]))
+    except (KeyError, TypeError) as error:
+        raise ReplyGenerationError("The paid model returned malformed structured output.") from error
+
+
+def _http_json(url, payload, headers, opener, timeout=20):
+    data = json.dumps(payload).encode("utf-8")
+    request = url_request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with opener(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except url_error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:240]
+        raise ReplyGenerationError(
+            f"{error.code} from the paid model API: {detail or error.reason}"
+        ) from error
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ReplyGenerationError(f"The paid model request failed: {error}") from error
+
+
 class ReplyGenerator:
-    def __init__(self, client=None, model=PAY_MODEL):
+    def __init__(self, client=None, model=PAY_MODEL, api_key=None):
         if client is None:
-            if not os.environ.get("OPENAI_API_KEY"):
+            key = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
+            if not key:
                 raise ReplyGenerationError(
-                    "Set OPENAI_API_KEY before using Hinge Prompt Reply mode."
+                    "Import or paste an OpenAI API key before using Prompt Reply."
                 )
             try:
                 from openai import OpenAI
@@ -346,7 +435,7 @@ class ReplyGenerator:
                 raise ReplyGenerationError(
                     "Install the OpenAI SDK with: python -m pip install -r requirements.txt"
                 ) from error
-            client = OpenAI(timeout=20.0, max_retries=0)
+            client = OpenAI(api_key=key, timeout=20.0, max_retries=0)
         self.client = client
         self.model = model
 
@@ -381,6 +470,133 @@ class ReplyGenerator:
             attempts=2,
             retry_exceptions=Exception,
             failure_prefix="OpenAI reply generation failed",
+        )
+
+
+class CloudReplyGenerator:
+    """Generate replies with Anthropic, Google, xAI, or DeepSeek."""
+
+    def __init__(self, choice, api_key=None, opener=None):
+        key = (api_key or os.environ.get(choice.env_key) or "").strip()
+        if choice.provider == "google" and not key:
+            key = (os.environ.get("GOOGLE_API_KEY") or "").strip()
+        if not key:
+            raise ReplyGenerationError(
+                f"Import or paste a {choice.provider_title} API key before using Prompt Reply."
+            )
+        self.choice = choice
+        self.model = choice.model_id
+        self.api_key = key
+        self.opener = opener or url_request.urlopen
+
+    def _json_messages(self, prompts, tone):
+        messages = build_input(prompts, tone)
+        system = next(item["content"] for item in messages if item["role"] == "system")
+        user = next(item["content"] for item in messages if item["role"] == "user")
+        user = (
+            f"{user}\nReturn JSON only with keys prompt_id and reply. "
+            f"The reply must be one ASCII line of at most {MAX_REPLY_LENGTH} characters."
+        )
+        return system, user
+
+    def _openai_compatible_chat(self, url, prompts, tone):
+        system, user = self._json_messages(prompts, tone)
+        payload = _http_json(
+            url,
+            {
+                "model": self.model,
+                "temperature": 0.4,
+                "max_tokens": 256,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            self.opener,
+        )
+        try:
+            return payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ReplyGenerationError("The paid model returned malformed structured output.") from error
+
+    def _request(self, prompts, tone):
+        provider = self.choice.provider
+        if provider == "anthropic":
+            system, user = self._json_messages(prompts, tone)
+            payload = _http_json(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "model": self.model,
+                    "max_tokens": 256,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                },
+                {
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                self.opener,
+            )
+            try:
+                return parse_generated_reply(payload["content"][0]["text"])
+            except (KeyError, IndexError, TypeError) as error:
+                raise ReplyGenerationError(
+                    "The paid model returned malformed structured output."
+                ) from error
+        if provider == "google":
+            system, user = self._json_messages(prompts, tone)
+            payload = _http_json(
+                (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{self.model}:generateContent?key={self.api_key}"
+                ),
+                {
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [{"role": "user", "parts": [{"text": user}]}],
+                    "generationConfig": {
+                        "temperature": 0.4,
+                        "maxOutputTokens": 256,
+                        "responseMimeType": "application/json",
+                    },
+                },
+                {"Content-Type": "application/json"},
+                self.opener,
+            )
+            try:
+                return parse_generated_reply(
+                    payload["candidates"][0]["content"]["parts"][0]["text"]
+                )
+            except (KeyError, IndexError, TypeError) as error:
+                raise ReplyGenerationError(
+                    "The paid model returned malformed structured output."
+                ) from error
+        if provider == "xai":
+            return parse_generated_reply(
+                self._openai_compatible_chat("https://api.x.ai/v1/chat/completions", prompts, tone)
+            )
+        if provider == "deepseek":
+            return parse_generated_reply(
+                self._openai_compatible_chat(
+                    "https://api.deepseek.com/chat/completions",
+                    prompts,
+                    tone,
+                )
+            )
+        raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
+
+    def generate(self, prompts, tone):
+        return _generate_with_retries(
+            self._request,
+            prompts,
+            tone,
+            attempts=2,
+            retry_exceptions=Exception,
+            failure_prefix=f"{self.choice.provider_title} reply generation failed",
         )
 
 

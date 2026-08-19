@@ -4,6 +4,7 @@ import unittest
 
 from profile_reply import CapturedPrompt
 from reply_generation import (
+    CloudReplyGenerator,
     GeneratedReply,
     LOCAL_FREE_MODEL,
     OllamaReplyGenerator,
@@ -12,6 +13,7 @@ from reply_generation import (
     ReplyGenerator,
     TONE_INSTRUCTIONS,
     build_input,
+    paid_model_from_selection,
     random_pickup_line,
     validate_fallback_pickup_line,
     validate_photo_pickup_line,
@@ -141,6 +143,19 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertEqual(call["model"], PAY_MODEL)
         self.assertTrue(call["text"]["format"]["strict"])
 
+    def test_uses_selected_pay_model(self):
+        client = FakeClient([json.dumps({
+            "prompt_id": "prompt-1",
+            "reply": "I bring obscure trivia facts and dangerously confident guesses.",
+        })])
+
+        ReplyGenerator(client=client, model="gpt-5-mini").generate(
+            [self.prompt],
+            "Dry & clever",
+        )
+
+        self.assertEqual(client.responses.calls[0]["model"], "gpt-5-mini")
+
     def test_retries_once_after_malformed_output(self):
         client = FakeClient([
             "not json",
@@ -207,6 +222,32 @@ class ReplyGenerationTests(unittest.TestCase):
         with self.assertRaises(ReplyGenerationError):
             ReplyGenerator(client=client).generate([self.prompt], "Playful & clean")
         self.assertEqual(len(client.responses.calls), 2)
+
+    def test_anthropic_and_gemini_models_use_their_own_apis(self):
+        reply_json = json.dumps({
+            "prompt_id": "prompt-1",
+            "reply": "Trivia night sounds like a dangerously fun first plot twist.",
+        })
+        anthropic = FakeOpener([{"content": [{"text": reply_json}]}])
+        gemini = FakeOpener([{
+            "candidates": [{"content": {"parts": [{"text": reply_json}]}}],
+        }])
+
+        claude = CloudReplyGenerator(
+            paid_model_from_selection("Claude Sonnet 4.6"),
+            api_key="sk-ant-test",
+            opener=anthropic,
+        ).generate([self.prompt], "Playful & clean")
+        flash = CloudReplyGenerator(
+            paid_model_from_selection("Gemini 2.5 Flash"),
+            api_key="gemini-test",
+            opener=gemini,
+        ).generate([self.prompt], "Playful & clean")
+
+        self.assertIn("Trivia", claude.reply)
+        self.assertIn("Trivia", flash.reply)
+        self.assertIn("api.anthropic.com", anthropic.requests[0][0].full_url)
+        self.assertIn("generativelanguage.googleapis.com", gemini.requests[0][0].full_url)
 
     def test_free_local_generator_uses_ollama_without_an_api_key(self):
         opener = FakeOpener([

@@ -74,7 +74,6 @@ Prompt Reply reads the mirrored screen (written prompts and photos), so pick a *
 2. Open `reply_generation.py` and change the local model constant:
 
    ```python
-   PAY_MODEL = "gpt-5.6-luna"
    LOCAL_FREE_MODEL = "llama3.2-vision:latest"
    ```
 
@@ -82,17 +81,21 @@ Prompt Reply reads the mirrored screen (written prompts and photos), so pick a *
 
 If the name does not match an installed model, the app will tell you to run `ollama pull <model>`.
 
-### Optional: OpenAI replies
+### Optional: paid API replies
 
-Set a key only if you choose **OpenAI API** in the app:
+Choose **Paid API** in the app, select an available model, then import or paste that provider's API key. **Import** reads a `.txt` or `.env` file such as:
 
-```bash
-export OPENAI_API_KEY="your-api-key"
+```
+OPENAI_API_KEY="your-api-key"
+ANTHROPIC_API_KEY="your-api-key"
+GEMINI_API_KEY="your-api-key"
+XAI_API_KEY="your-api-key"
+DEEPSEEK_API_KEY="your-api-key"
 ```
 
-The paid model name lives in `reply_generation.py` as `PAY_MODEL` (default `gpt-5.6-luna`). To use a different OpenAI model, change that constant and restart (or rebuild the app).
+The key stays in memory for this session and is not written to disk. Matching environment variables are used to pre-fill the field for that provider.
 
-Never commit this key. The OpenAI engine sends recognized prompt/answer text only — not photos or screenshots.
+Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and include OpenAI, Claude, Gemini, Grok, and DeepSeek. Prompt Reply sends recognized prompt/answer text only — never photos or screenshots.
 
 ---
 
@@ -114,7 +117,7 @@ Never commit this key. The OpenAI engine sends recognized prompt/answer text onl
 4. In the control panel:
    - Dating app: **Hinge** (required for a working run)
    - Workflow: **Auto Like** or **Prompt Reply**
-   - For Prompt Reply: reply engine and tone
+   - For Prompt Reply: reply engine and tone. If you choose **Paid API**, pick a model and import or paste that provider's API key.
    - Number of rotations (Auto Like = like cycles; Prompt Reply = profiles)
 
 5. Click **Start**. Click **Stop** or press **Esc** to halt.
@@ -125,7 +128,7 @@ Never commit this key. The OpenAI engine sends recognized prompt/answer text onl
 
 **Auto Like** finds Hinge’s like button, clicks it, then looks for **Send Like** / **Send Priority Like** and clicks that. If a target is not detected, that cycle is skipped.
 
-**Prompt Reply** (Hinge only) finds the first written prompt on a profile, generates a short reply, pastes it only after on-screen verification, then sends. If prompt reply fails, it can fall back to a photo-grounded pickup line, a custom fallback line you typed, or a built-in clean line — then skip to the next profile when recovery fails.
+**Prompt Reply** (Hinge only) finds the first written prompt on a profile, generates a short reply, pastes it only after on-screen verification, then sends. If prompt reply fails, it can fall back to a photo-grounded pickup line or a built-in clean line — then skip to the next profile when recovery fails.
 
 Reply tones: **Playful & clean**, **Flirty & bold**, **Dry & clever**. Replies are capped at 140 characters and checked locally before send.
 
@@ -140,14 +143,14 @@ python -m PyInstaller --clean --noconfirm main_scoop.spec
 
 The app is written to `dist/The Scoop UP V2.0.0.app`.
 
-If you use OpenAI with the standalone build, launch it from Terminal so the key is available:
+If you use a paid model with the standalone build, select the model and import the key in the app. You can still pre-fill the matching field from Terminal:
 
 ```bash
 OPENAI_API_KEY="your-api-key" \
   "dist/The Scoop UP V2.0.0.app/Contents/MacOS/The Scoop UP V2.0.0"
 ```
 
-A different `PAY_MODEL` or `LOCAL_FREE_MODEL` only takes effect in the `.app` after you rebuild.
+A different `LOCAL_FREE_MODEL` only takes effect in the `.app` after you rebuild. Paid models are chosen in the UI.
 
 ---
 
@@ -155,5 +158,5 @@ A different `PAY_MODEL` or `LOCAL_FREE_MODEL` only takes effect in the `.app` af
 
 - This tool drives the mirrored iPhone UI. Dating-app rules and account risk are your responsibility.
 - Captured screens stay in process memory for detection; they are not written to disk for Prompt Reply.
-- Local — Free talks only to Ollama on `127.0.0.1`. OpenAI is used only when that engine is selected.
+- Local — Free talks only to Ollama on `127.0.0.1`. Paid API is used only when that engine is selected.
 - Coordinates are never reused after a click. If a button or heart cannot be found, nothing is clicked.

@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import filedialog
 import zlib
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,13 +29,45 @@ from profile_reply import (
     viewport_similarity,
 )
 from reply_generation import (
+    API_KEY_ENV_NAMES,
+    CloudReplyGenerator,
     OllamaReplyGenerator,
+    PAID_ENGINE,
+    PAY_MODEL,
+    PAY_MODELS,
     ReplyGenerationError,
     ReplyGenerator,
     TONE_INSTRUCTIONS,
+    paid_model_from_selection,
     random_pickup_line,
-    validate_fallback_pickup_line,
 )
+
+PAID_MODEL_PROMPT = "Select a model…"
+
+
+def is_paid_engine(engine):
+    return engine in {PAID_ENGINE, "OpenAI API"}
+
+
+def parse_openai_api_key(text, env_names=API_KEY_ENV_NAMES):
+    """Read an API key from pasted text or a small env/key file."""
+    if not isinstance(text, str):
+        return ""
+    allowed = {name for name in env_names} | {name.lower() for name in env_names}
+    for raw in text.splitlines():
+        line = raw.strip().strip("'\"")
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" in line:
+            name, value = line.split("=", 1)
+            if name.strip() not in allowed:
+                continue
+            line = value.strip().strip("'\"")
+        if line:
+            return line
+    return ""
 
 try:
     import AppKit
@@ -944,9 +977,9 @@ class MacClipboard:
 class ScoopUpApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("The Scoop UP — Automatic Detection")
-        self.root.geometry("500x585")
-        self.root.resizable(True, False)
+        self.root.title("The Scoop UP")
+        self.root.geometry("380x320")
+        self.root.resizable(False, False)
 
         self.mouse = Controller()
         self.keyboard = KeyboardController()
@@ -960,56 +993,99 @@ class ScoopUpApp:
 
         tk.Label(
             root,
-            text="Automatic iPhone Mirroring Detection",
-            font=("Helvetica", 16, "bold"),
-        ).pack(pady=(14, 8))
+            text="iPhone Mirroring Detection",
+            font=("Helvetica", 13, "bold"),
+        ).pack(pady=(8, 4))
 
-        tk.Label(root, text="Dating app:").pack()
+        form = tk.Frame(root)
+        form.pack(padx=12)
+        form.columnconfigure(1, weight=1)
+        self.form = form
+
         self.platform_var = tk.StringVar(value="Hinge")
-        tk.OptionMenu(root, self.platform_var, "Hinge", "Tinder").pack()
-
-        tk.Label(root, text="Workflow:").pack(pady=(8, 0))
         self.workflow_var = tk.StringVar(value="Auto Like")
-        tk.OptionMenu(root, self.workflow_var, "Auto Like", "Prompt Reply").pack()
-
-        tk.Label(root, text="Reply engine:").pack(pady=(8, 0))
         self.engine_var = tk.StringVar(value="Local — Free")
-        tk.OptionMenu(root, self.engine_var, "Local — Free", "OpenAI API").pack()
-
-        tk.Label(root, text="Reply tone:").pack(pady=(8, 0))
+        self.paid_model_var = tk.StringVar(value=PAID_MODEL_PROMPT)
+        self._provider_keys = {
+            "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", ""),
+            "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+            "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY", ""),
+            "XAI_API_KEY": os.environ.get("XAI_API_KEY", ""),
+            "DEEPSEEK_API_KEY": os.environ.get("DEEPSEEK_API_KEY", ""),
+        }
+        self._key_env = "OPENAI_API_KEY"
+        self.api_key_var = tk.StringVar(value="")
         self.tone_var = tk.StringVar(value="Playful & clean")
-        tk.OptionMenu(root, self.tone_var, *TONE_INSTRUCTIONS.keys()).pack()
-
-        tk.Label(root, text="Fallback pickup line (optional):").pack(pady=(8, 0))
-        self.fallback_line_entry = tk.Entry(root, width=52, justify="center")
-        self.fallback_line_entry.pack()
-        tk.Label(
-            root,
-            text="Leave blank to generate a line from the first photo locally.",
-            font=("Helvetica", 10),
-        ).pack()
-
-        tk.Label(root, text="Number of rotations:").pack(pady=(8, 0))
-        self.rotations_entry = tk.Entry(root, width=12, justify="center")
+        self.rotations_entry = tk.Entry(form, width=14, justify="center")
         self.rotations_entry.insert(0, "20")
-        self.rotations_entry.pack()
+
+        api_key_row = tk.Frame(form)
+        self.api_key_entry = tk.Entry(
+            api_key_row,
+            textvariable=self.api_key_var,
+            show="*",
+            width=18,
+        )
+        self.api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(
+            api_key_row,
+            text="Import",
+            command=self.import_api_key,
+            width=7,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        self._base_form_rows = (
+            (
+                tk.Label(form, text="Dating app:"),
+                tk.OptionMenu(form, self.platform_var, "Hinge", "Tinder"),
+            ),
+            (
+                tk.Label(form, text="Workflow:"),
+                tk.OptionMenu(form, self.workflow_var, "Auto Like", "Prompt Reply"),
+            ),
+            (
+                tk.Label(form, text="Reply engine:"),
+                tk.OptionMenu(form, self.engine_var, "Local — Free", PAID_ENGINE),
+            ),
+            (
+                tk.Label(form, text="Reply tone:"),
+                tk.OptionMenu(form, self.tone_var, *TONE_INSTRUCTIONS.keys()),
+            ),
+            (tk.Label(form, text="Rotations:"), self.rotations_entry),
+        )
+        self.paid_model_menu = tk.OptionMenu(
+            form,
+            self.paid_model_var,
+            PAID_MODEL_PROMPT,
+            *PAY_MODELS,
+        )
+        self._paid_model_row = (
+            tk.Label(form, text="Paid model:"),
+            self.paid_model_menu,
+        )
+        self._api_key_row = (tk.Label(form, text="API key:"), api_key_row)
+
+        self.engine_var.trace_add("write", lambda *_args: self._layout_form())
+        self.paid_model_var.trace_add("write", lambda *_args: self._layout_form())
+        self._layout_form()
 
         button_frame = tk.Frame(root)
-        button_frame.pack(pady=12)
-        self.start_button = tk.Button(button_frame, text="Start", command=self.on_start, width=10)
-        self.start_button.grid(row=0, column=0, padx=5)
-        self.stop_button = tk.Button(button_frame, text="Stop", command=self.stop, width=10)
-        self.stop_button.grid(row=0, column=1, padx=5)
-        self.restart_button = tk.Button(button_frame, text="Restart", command=self.restart, width=10)
-        self.restart_button.grid(row=0, column=2, padx=5)
+        button_frame.pack(pady=(8, 4))
+        self.start_button = tk.Button(button_frame, text="Start", command=self.on_start, width=8)
+        self.start_button.grid(row=0, column=0, padx=3)
+        self.stop_button = tk.Button(button_frame, text="Stop", command=self.stop, width=8)
+        self.stop_button.grid(row=0, column=1, padx=3)
+        self.restart_button = tk.Button(button_frame, text="Restart", command=self.restart, width=8)
+        self.restart_button.grid(row=0, column=2, padx=3)
 
         self.status_label = tk.Label(
             root,
             text="Open iPhone Mirroring, choose an app, then press Start.",
-            wraplength=390,
+            wraplength=360,
             justify="center",
         )
-        self.status_label.pack(padx=12)
+        self.status_label.pack(padx=10, pady=(2, 8))
 
         self.settings_button = tk.Button(
             root,
@@ -1018,14 +1094,88 @@ class ScoopUpApp:
         )
         # This button is intentionally hidden until capture permission fails.
         self.root.bind("<Escape>", lambda _event: self.stop())
+        self._fit_window()
+
+    def _selected_paid_model(self):
+        return paid_model_from_selection(self.paid_model_var.get().strip())
+
+    def _sync_provider_key(self):
+        choice = self._selected_paid_model()
+        current = self.api_key_var.get()
+        if self._key_env:
+            self._provider_keys[self._key_env] = current
+        if choice is None:
+            self._key_env = "OPENAI_API_KEY"
+            return
+        self._key_env = choice.env_key
+        self.api_key_var.set(self._provider_keys.get(choice.env_key, ""))
+
+    def _layout_form(self):
+        for child in self.form.grid_slaves():
+            child.grid_forget()
+        rows = list(self._base_form_rows)
+        paid = is_paid_engine(self.engine_var.get())
+        if paid:
+            self._sync_provider_key()
+            rows[3:3] = [self._paid_model_row]
+            if self._selected_paid_model():
+                rows[4:4] = [self._api_key_row]
+        for index, (label, widget) in enumerate(rows):
+            label.grid(row=index, column=0, sticky="e", padx=(0, 8), pady=2)
+            widget.grid(row=index, column=1, sticky="ew", pady=2)
+        if hasattr(self, "status_label") and not self.is_running:
+            choice = self._selected_paid_model()
+            if paid and choice is None:
+                message = "Select an available paid model."
+            elif paid and not self.api_key_var.get().strip():
+                message = f"Import or paste your {choice.provider_title} API key."
+            else:
+                message = "Open iPhone Mirroring, choose an app, then press Start."
+            self.status_label.config(text=message)
+            self._fit_window()
+
+    def import_api_key(self):
+        choice = self._selected_paid_model()
+        provider = choice.provider_title if choice else "paid model"
+        env_names = (choice.env_key,) if choice else API_KEY_ENV_NAMES
+        path = filedialog.askopenfilename(
+            title=f"Import {provider} API key",
+            filetypes=(
+                ("Text files", "*.txt"),
+                ("Env files", "*.env"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as error:
+            self.render_status(f"Could not read the API key file: {error}")
+            return
+        key = parse_openai_api_key(text, env_names=env_names + API_KEY_ENV_NAMES)
+        if not key:
+            self.render_status(f"The selected file did not contain a {provider} API key.")
+            return
+        self.api_key_var.set(key)
+        if choice is not None:
+            self._provider_keys[choice.env_key] = key
+        self.render_status(f"{provider} API key imported.")
+
+    def _fit_window(self):
+        self.root.update_idletasks()
+        width = max(self.root.winfo_reqwidth(), 360)
+        height = self.root.winfo_reqheight()
+        self.root.geometry(f"{width}x{height}")
 
     def render_status(self, message, show_settings=False):
         self.status_label.config(text=message)
         if show_settings:
             if not self.settings_button.winfo_manager():
-                self.settings_button.pack(pady=(12, 0))
+                self.settings_button.pack(pady=(4, 8))
         else:
             self.settings_button.pack_forget()
+        self._fit_window()
 
     def set_status(self, message, show_settings=False):
         self.root.after(0, lambda: self.render_status(message, show_settings))
@@ -1789,16 +1939,11 @@ class ScoopUpApp:
         self,
         scanner,
         cycle,
-        custom_pickup_line="",
         photo_generator=None,
         tone="Playful & clean",
     ):
         """Recover a failed prompt with a verified clean pickup-line comment."""
-        pickup_line = (
-            validate_fallback_pickup_line(custom_pickup_line)
-            if custom_pickup_line.strip()
-            else None
-        )
+        pickup_line = None
         self.set_status(
             f"Profile {cycle}: prompt failed; preparing a photo-grounded fallback..."
         )
@@ -1966,8 +2111,9 @@ class ScoopUpApp:
     def run_prompt_reply(
         self,
         tone,
-        engine="OpenAI API",
-        fallback_pickup_line="",
+        engine=PAID_ENGINE,
+        paid_model=PAY_MODEL,
+        api_key="",
     ):
         started_at = time.monotonic()
         completed = 0
@@ -1976,11 +2122,17 @@ class ScoopUpApp:
         attempted = 0
         batch_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         try:
-            generator = (
-                OllamaReplyGenerator()
-                if engine == "Local — Free"
-                else ReplyGenerator()
-            )
+            if engine == "Local — Free":
+                generator = OllamaReplyGenerator()
+            else:
+                choice = paid_model_from_selection(paid_model)
+                if choice is None or choice.provider == "openai":
+                    generator = ReplyGenerator(
+                        model=(choice.model_id if choice else paid_model or PAY_MODEL),
+                        api_key=api_key,
+                    )
+                else:
+                    generator = CloudReplyGenerator(choice, api_key=api_key)
             if hasattr(generator, "ensure_ready"):
                 self.set_status("Warming up the local reply model...")
                 generator.ensure_ready()
@@ -2010,7 +2162,6 @@ class ScoopUpApp:
                             fallback_sent = self.fallback_regular_like(
                                 scanner,
                                 cycle,
-                                fallback_pickup_line,
                                 photo_generator=generator,
                                 tone=tone,
                             )
@@ -2092,27 +2243,20 @@ class ScoopUpApp:
         workflow = self.workflow_var.get()
         platform = self.platform_var.get()
         engine = self.engine_var.get()
-        fallback_pickup_line = self.fallback_line_entry.get().strip()
+        choice = self._selected_paid_model()
+        paid_model = choice.label if choice else ""
+        api_key = self.api_key_var.get().strip()
         if workflow == "Prompt Reply" and platform != "Hinge":
             self.status_label.config(text="Prompt Reply mode currently supports Hinge only.")
             return
-        if (
-            workflow == "Prompt Reply"
-            and engine == "OpenAI API"
-            and not os.environ.get("OPENAI_API_KEY")
-        ):
+        if workflow == "Prompt Reply" and is_paid_engine(engine) and choice is None:
+            self.status_label.config(text="Select an available paid model.")
+            return
+        if workflow == "Prompt Reply" and is_paid_engine(engine) and not api_key:
             self.status_label.config(
-                text="Set OPENAI_API_KEY before using Prompt Reply mode."
+                text=f"Import or paste your {choice.provider_title} API key."
             )
             return
-        if workflow == "Prompt Reply" and fallback_pickup_line:
-            try:
-                fallback_pickup_line = validate_fallback_pickup_line(
-                    fallback_pickup_line
-                )
-            except ReplyGenerationError as error:
-                self.status_label.config(text=str(error))
-                return
 
         try:
             window = find_iphone_mirroring_window()
@@ -2129,11 +2273,16 @@ class ScoopUpApp:
         self.start_button.config(state=tk.DISABLED)
         if workflow == "Prompt Reply":
             tone = self.tone_var.get()
+            engine_label = (
+                f"{choice.provider_title} ({choice.label})"
+                if is_paid_engine(engine) and choice is not None
+                else engine
+            )
             self.render_status(
-                f"Starting Hinge Prompt Reply with {tone} tone using {engine}..."
+                f"Starting Hinge Prompt Reply with {tone} tone using {engine_label}..."
             )
             target = self.run_prompt_reply
-            arguments = (tone, engine, fallback_pickup_line)
+            arguments = (tone, engine, paid_model, api_key)
         else:
             self.render_status(f"Starting automatic {platform} detection...")
             target = self.run_auto_like
