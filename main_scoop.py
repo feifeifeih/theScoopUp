@@ -927,6 +927,8 @@ SEND_SETTLE_TIMEOUT = 1.1
 SEND_POLL_INTERVAL = 0.15
 SEND_LIKE_MIN_SCORE = 0.55
 COMPOSER_VERTICAL_RATIO = 0.085
+TYPE_CHARACTER_DELAY = 0.018
+TYPE_SPACE_DELAY = 0.045
 
 
 def comment_point_from_send(window, send_point):
@@ -1429,8 +1431,15 @@ class ScoopUpApp:
         for character in reply:
             if not self.is_running:
                 return
-            self.keyboard.type(character)
-            time.sleep(0.006)
+            if character == " ":
+                # Mirroring can lose a space embedded in a fast type() stream.
+                # Send it as its own key event and give the phone time to apply it.
+                self.keyboard.press(Key.space)
+                self.keyboard.release(Key.space)
+                time.sleep(TYPE_SPACE_DELAY)
+            else:
+                self.keyboard.type(character)
+                time.sleep(TYPE_CHARACTER_DELAY)
 
     def verify_reply_entry(
         self,
@@ -1540,10 +1549,15 @@ class ScoopUpApp:
                 self.interruptible_wait(0.15)
                 self.click_once(comment_point)
                 self.interruptible_wait(0.35)
-                if reply.isascii():
+                if attempt == 1:
+                    # Paste is atomic, so a focus/cursor event cannot join words
+                    # halfway through entry. Slower direct typing remains a
+                    # fallback for Mirroring sessions that reject paste.
+                    saved_clipboard = self.paste_reply(reply, defer_restore=True)
+                elif reply.isascii():
                     self.type_reply(reply)
                 else:
-                    saved_clipboard = self.paste_reply(reply, defer_restore=True)
+                    self.paste_reply(reply, defer_restore=True)
                 self.interruptible_wait(0.2)
                 last_capture, last_lines = self.verify_reply_entry(
                     reply,
@@ -2379,23 +2393,28 @@ class ScoopUpApp:
                     recovery = "uncertain_send"
                     if self.is_running and self._prompt_failure_can_skip:
                         if engine == "Local — Free":
-                            use_photo_generator = True
+                            should_fallback = True
                         elif is_paid_engine(engine):
-                            use_photo_generator = paid_photo_fallback_enabled(
+                            # A paid photo fallback is safe only when scanning
+                            # found no written prompt. Once a prompt was found,
+                            # rewinding and choosing the topmost heart would
+                            # redirect the reply to the first photo.
+                            should_fallback = paid_photo_fallback_enabled(
                                 engine,
                                 self._prompt_stage,
                                 error,
                             )
                         else:
-                            use_photo_generator = False
-                        with native_autorelease_pool():
-                            fallback_sent = self.fallback_regular_like(
-                                scanner,
-                                cycle,
-                                photo_generator=generator,
-                                tone=tone,
-                                use_photo_generator=use_photo_generator,
-                            )
+                            should_fallback = False
+                        if should_fallback:
+                            with native_autorelease_pool():
+                                fallback_sent = self.fallback_regular_like(
+                                    scanner,
+                                    cycle,
+                                    photo_generator=generator,
+                                    tone=tone,
+                                    use_photo_generator=True,
+                                )
                         if fallback_sent:
                             fallback_likes += 1
                             recovery = "pickup_line_sent"

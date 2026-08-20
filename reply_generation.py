@@ -57,9 +57,10 @@ API_KEY_ENV_NAMES = (
 LOCAL_FREE_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 MAX_REPLY_LENGTH = 140
-PAID_MAX_REPLY_LENGTH = 80
+PAID_MAX_REPLY_LENGTH = 140
 PAID_HOUSE_RULES = (
     "Rules: Return ONLY the reply. No quotes, labels, explanation, or extra text. "
+    "Use only letters, numbers, apostrophes, commas, and spaces. "
     f"Maximum {PAID_MAX_REPLY_LENGTH} characters. One line only."
 )
 TONE_INSTRUCTIONS = {
@@ -152,22 +153,24 @@ def validate_fallback_pickup_line(line):
     """Validate a fallback pickup line before it can reach Hinge."""
     if not isinstance(line, str):
         raise ReplyGenerationError("The fallback pickup line must be text.")
-    text = line.strip()
-    if not text or "\n" in text or "\r" in text:
+    raw_text = line.strip()
+    if not raw_text or "\n" in raw_text or "\r" in raw_text:
         raise ReplyGenerationError("The fallback pickup line must be one non-empty line.")
+    if any(re.search(pattern, raw_text, re.IGNORECASE) for pattern in UNSAFE_PATTERNS):
+        raise ReplyGenerationError("The fallback pickup line failed local safety validation.")
+    text = normalize_reply_style(raw_text).rstrip(" ,")
+    if not text:
+        raise ReplyGenerationError("The fallback pickup line contained no usable text.")
     if len(text) > MAX_REPLY_LENGTH:
         raise ReplyGenerationError(
             f"The fallback pickup line exceeds {MAX_REPLY_LENGTH} characters."
         )
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in UNSAFE_PATTERNS):
-        raise ReplyGenerationError("The fallback pickup line failed local safety validation.")
     return text
 
 
 def validate_photo_pickup_line(line, visual_detail):
     """Require a safe line to repeat a concrete detail reported from the image."""
     text = validate_fallback_pickup_line(line)
-    text = text.encode("ascii", "ignore").decode("ascii").strip()
     detail = str(visual_detail).encode("ascii", "ignore").decode("ascii").strip()
     if not detail or len(detail) > 60:
         raise ReplyGenerationError("The photo description was missing or too long.")
@@ -210,6 +213,18 @@ SMART_QUOTE_MAP = str.maketrans({
 })
 
 
+def normalize_reply_style(text):
+    """Keep casual, directly typeable text with only commas and apostrophes."""
+    text = str(text or "").translate(SMART_QUOTE_MAP)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    # Replace disallowed punctuation with a space so removing a dash or other
+    # separator can never join two words together.
+    text = re.sub(r"[^A-Za-z0-9,' ]+", " ", text)
+    text = re.sub(r"(?<![A-Za-z0-9])'|'(?![A-Za-z0-9])", "", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def prepare_reply_for_entry(text, max_length=MAX_REPLY_LENGTH):
     """Shape raw model text for Hinge entry without content validation."""
     text = str(text or "").strip()
@@ -230,12 +245,10 @@ def prepare_reply_for_entry(text, max_length=MAX_REPLY_LENGTH):
             )
         ]
         text = max(candidates or lines, key=len)
-    text = text.translate(SMART_QUOTE_MAP).strip().strip("\"'")
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"\s+", " ", text).strip()
+    text = normalize_reply_style(text.strip().strip("\"'"))
     if len(text) > max_length:
         text = text[:max_length].rstrip()
-    return text
+    return text.rstrip(" ,")
 
 
 def extract_openai_response_text(response):
@@ -258,32 +271,27 @@ def extract_openai_response_text(response):
 def validate_reply(reply, prompt_ids):
     if not isinstance(reply, GeneratedReply):
         raise ReplyGenerationError("The model returned an invalid reply object.")
-    text = reply.reply.strip().translate(SMART_QUOTE_MAP)
-    # iPhone Mirroring occasionally drops clipboard paste, while direct
-    # keyboard entry is reliable. Remove decorative non-ASCII characters
-    # (most commonly model-added emoji) so every accepted reply can use the
-    # direct typing path.
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"\s+([,.!?])", r"\1", text).strip()
     if reply.prompt_id not in set(prompt_ids):
         raise ReplyGenerationError("The model selected an unknown prompt.")
-    if not text or "\n" in text or "\r" in text:
+    raw_text = reply.reply.strip().translate(SMART_QUOTE_MAP)
+    if not raw_text or "\n" in raw_text or "\r" in raw_text:
         raise ReplyGenerationError("The reply must be one non-empty line.")
-    if len(text) > MAX_REPLY_LENGTH:
-        raise ReplyGenerationError(f"The reply exceeds {MAX_REPLY_LENGTH} characters.")
-    if re.search(r"\s['\"]$", text) or re.match(r"^['\"]\s", text):
+    if re.search(r"\s['\"]$", raw_text) or re.match(r"^['\"]\s", raw_text):
         raise ReplyGenerationError("The reply contains an unmatched quote.")
-    if re.search(r"[,;:\-–—]\s*$", text) or re.search(
+    if re.search(r"[,;:\-–—]\s*$", raw_text) or re.search(
         r"\b(?:and|but|for|or|to|with)\s*$",
-        text,
+        raw_text,
         re.IGNORECASE,
     ):
         raise ReplyGenerationError("The reply appears truncated or unfinished.")
+    if any(re.search(pattern, raw_text, re.IGNORECASE) for pattern in UNSAFE_PATTERNS):
+        raise ReplyGenerationError("The reply failed local safety validation.")
+    text = normalize_reply_style(raw_text).rstrip(" ,")
+    if len(text) > MAX_REPLY_LENGTH:
+        raise ReplyGenerationError(f"The reply exceeds {MAX_REPLY_LENGTH} characters.")
     normalized = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
     if normalized in GENERIC_REPLIES or len(normalized.split()) < 3:
         raise ReplyGenerationError("The reply is too generic.")
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in UNSAFE_PATTERNS):
-        raise ReplyGenerationError("The reply failed local safety validation.")
     return GeneratedReply(reply.prompt_id, text)
 
 
@@ -366,7 +374,7 @@ def build_input(prompts, tone):
         "distinctive content word exactly as written in the chosen prompt or answer. "
         "Do not write a generic reaction and do not respond to the prompt heading alone. "
         "Do not mention appearance, protected traits, sex, contact details, or the fact that AI wrote it. "
-        "Use ASCII characters only: no emoji or decorative Unicode. "
+        "Use only letters, numbers, apostrophes, commas, and spaces. "
         "Avoid generic greetings. Return only the requested structured result."
     )
     user = (
@@ -386,7 +394,7 @@ def build_paid_input(prompts, tone):
     selected = prompts[0]
     return (
         f"Generate a {tone} reply for this dating profile prompt:\n"
-        f"{selected.prompt + " " + selected.answer}\n\n"
+        f"{selected.prompt} {selected.answer}\n\n"
         f"{PAID_HOUSE_RULES}"
     )
 
@@ -468,30 +476,6 @@ def paid_model_from_selection(value):
         if value in {model.label, model.model_id}:
             return model
     return None
-
-
-def parse_generated_reply(payload):
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8")
-    if isinstance(payload, str):
-        text = payload.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            raise ReplyGenerationError("The paid model returned malformed structured output.")
-        try:
-            payload = json.loads(text[start:end + 1])
-        except json.JSONDecodeError as error:
-            raise ReplyGenerationError(
-                "The paid model returned malformed structured output."
-            ) from error
-    try:
-        return GeneratedReply(str(payload["prompt_id"]), str(payload["reply"]))
-    except (KeyError, TypeError) as error:
-        raise ReplyGenerationError("The paid model returned malformed structured output.") from error
 
 
 def _http_json(url, payload, headers, opener, timeout=20):
@@ -960,8 +944,9 @@ class OllamaReplyGenerator:
             "Address the profile owner; never call or compare them to an animal or object. For "
             "a pet, say 'your cat' or 'your dog'. visual_detail should be a specific 2-6 word "
             "noun phrase, such as 'orange cat' rather than just 'cat'. "
-            "The line must repeat at least one concrete word exactly from visual_detail, be "
-            f"ASCII, one line, and at most {MAX_REPLY_LENGTH} characters."
+            "The line must repeat at least one concrete word exactly from visual_detail. "
+            "Use only letters, numbers, apostrophes, commas, and spaces. Keep it one line "
+            f"and at most {MAX_REPLY_LENGTH} characters."
         )
         return self._vision_chat(
             image_bytes,

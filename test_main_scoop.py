@@ -574,13 +574,13 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
 
         self.assertTrue(captured.get("use_photo_generator"))
 
-    def test_paid_send_failure_skips_photo_fallback(self):
+    def test_paid_prompt_failure_skips_first_photo_fallback_entirely(self):
         app = self.make_app()
         app.make_profile_scanner = lambda _generator=None: object()
-        captured = {}
+        fallback_calls = []
 
         def fallback(*_args, **kwargs):
-            captured.update(kwargs)
+            fallback_calls.append(kwargs)
             return False
 
         def fail_send(*_args, **_kwargs):
@@ -597,7 +597,8 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         ):
             app.run_prompt_reply("Playful & clean", engine="Paid API")
 
-        self.assertFalse(captured.get("use_photo_generator"))
+        self.assertEqual(fallback_calls, [])
+        self.assertEqual(app.last_prompt_batch["failures"][0]["recovery"], "profile_skipped")
 
     def test_prompt_heart_hands_off_when_composer_starts_offscreen(self):
         app = self.make_app()
@@ -613,10 +614,10 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertIsNone(point)
         self.assertEqual(app.clicks.count(selected.heart_point), 3)
 
-    def test_ascii_local_reply_is_direct_typed_until_composer_verifies(self):
+    def test_reply_pastes_atomically_then_types_slowly_until_composer_verifies(self):
         app = self.make_app()
-        attempts = []
-        app.paste_reply = attempts.append
+        pasted = []
+        app.paste_reply = lambda reply, defer_restore=False: pasted.append(reply)
         typed = []
         app.type_reply = typed.append
         capture = SimpleNamespace(window=SimpleNamespace(height=800))
@@ -633,8 +634,8 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
             )
 
         self.assertIs(result_capture, capture)
-        self.assertEqual(attempts, [])
-        self.assertEqual(typed, ["A grounded reply"] * 3)
+        self.assertEqual(pasted, ["A grounded reply"])
+        self.assertEqual(typed, ["A grounded reply"] * 2)
 
     def test_paid_prepared_reply_is_direct_typed_until_composer_verifies(self):
         app = self.make_app()
@@ -656,8 +657,28 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
             )
 
         self.assertIs(result_capture, capture)
-        self.assertEqual(pasted, [])
-        self.assertEqual(typed, ["Trivia rivals first"] * 2)
+        self.assertEqual(pasted, ["Trivia rivals first"])
+        self.assertEqual(typed, ["Trivia rivals first"])
+
+    def test_direct_typing_sends_spaces_as_slow_explicit_key_events(self):
+        app = self.make_app()
+        app.clear_reply_field = lambda: None
+        typed = []
+        pressed = []
+        released = []
+        app.keyboard = SimpleNamespace(
+            type=typed.append,
+            press=pressed.append,
+            release=released.append,
+        )
+
+        with patch("main_scoop.time.sleep") as sleep:
+            ScoopUpApp.type_reply(app, "hi there")
+
+        self.assertEqual(typed, list("hithere"))
+        self.assertEqual(pressed, [Key.space])
+        self.assertEqual(released, [Key.space])
+        self.assertGreater(sleep.call_args_list[2].args[0], sleep.call_args_list[1].args[0])
 
     def test_reply_verification_uses_short_waits_only_between_attempts(self):
         app = self.make_app()

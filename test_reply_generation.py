@@ -42,7 +42,7 @@ class FallbackPickupLineTests(unittest.TestCase):
     def test_random_pickup_line_uses_injected_choice_and_stays_sendable(self):
         chosen = "Coffee or tacos: which one earns the first-date trophy?"
         line = random_pickup_line(lambda _options: chosen)
-        self.assertEqual(line, chosen)
+        self.assertEqual(line, "Coffee or tacos which one earns the first date trophy")
         self.assertLessEqual(len(line), 140)
         self.assertNotIn("\n", line)
 
@@ -54,7 +54,10 @@ class FallbackPickupLineTests(unittest.TestCase):
 
     def test_custom_pickup_line_accepts_clean_text(self):
         line = "Coffee first, or should we jump straight to planning an adventure?"
-        self.assertEqual(validate_fallback_pickup_line(line), line)
+        self.assertEqual(
+            validate_fallback_pickup_line(line),
+            "Coffee first, or should we jump straight to planning an adventure",
+        )
 
     def test_photo_line_must_be_grounded_and_avoid_appearance(self):
         self.assertEqual(
@@ -62,7 +65,7 @@ class FallbackPickupLineTests(unittest.TestCase):
                 "Does that surfboard come with lessons, or just confidence?",
                 "a surfboard by the ocean",
             ),
-            "Does that surfboard come with lessons, or just confidence?",
+            "Does that surfboard come with lessons, or just confidence",
         )
         with self.assertRaisesRegex(ReplyGenerationError, "concrete detail"):
             validate_photo_pickup_line(
@@ -152,19 +155,17 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertEqual(
             model_input,
             "Generate a Dry & clever reply for this dating profile prompt:\n"
-            "Together, we could\n"
-            "Dominate pub trivia\n\n"
+            "Together, we could Dominate pub trivia\n\n"
             "Rules: Return ONLY the reply. No quotes, labels, explanation, or extra text. "
-            "Maximum 80 characters. One line only.",
+            "Use only letters, numbers, apostrophes, commas, and spaces. "
+            "Maximum 140 characters. One line only.",
         )
-        self.assertNotIn("Sunday coffee", model_input)
-        self.assertIn("Rules: Return ONLY the reply", model_input)
 
     def test_paid_photo_input_includes_house_rules(self):
         text = build_paid_photo_input("Playful & clean")
         self.assertIn("dating profile photo", text)
         self.assertIn("Rules: Return ONLY the reply", text)
-        self.assertIn("Maximum 80 characters", text)
+        self.assertIn("Maximum 140 characters", text)
 
     def test_openai_photo_pickup_sends_image_and_house_rules(self):
         image = b"\x89PNG\r\n\x1a\n" + b"x" * 80
@@ -258,6 +259,12 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertEqual(prepared, "Pub trivia this serious deserves victory fries")
         self.assertTrue(prepared.isascii())
 
+    def test_prepare_reply_allows_only_casual_punctuation(self):
+        prepared = prepare_reply_for_entry(
+            "You're bold—coffee, tacos... or trivia?!"
+        )
+        self.assertEqual(prepared, "You're bold coffee, tacos or trivia")
+
     def test_uses_selected_pay_model(self):
         client = FakeClient(["A raw reply"])
 
@@ -320,7 +327,7 @@ class ReplyGenerationTests(unittest.TestCase):
             ["prompt-1"],
         )
 
-        self.assertEqual(reply.reply, "Trivia rivals deserve fries!")
+        self.assertEqual(reply.reply, "Trivia rivals deserve fries")
         self.assertTrue(reply.reply.isascii())
 
     def test_anthropic_and_gemini_models_use_their_own_apis(self):
@@ -341,8 +348,8 @@ class ReplyGenerationTests(unittest.TestCase):
             opener=gemini,
         ).generate([self.prompt], "Playful & clean")
 
-        self.assertEqual(claude.reply, raw_reply)
-        self.assertEqual(flash.reply, raw_reply)
+        self.assertEqual(claude.reply, raw_reply.rstrip("."))
+        self.assertEqual(flash.reply, raw_reply.rstrip("."))
         self.assertIn("api.anthropic.com", anthropic.requests[0][0].full_url)
         self.assertIn("generativelanguage.googleapis.com", gemini.requests[0][0].full_url)
         expected_input = build_paid_input([self.prompt], "Playful & clean")
@@ -380,8 +387,8 @@ class ReplyGenerationTests(unittest.TestCase):
             opener=deepseek_opener,
         ).generate([self.prompt], "Flirty & bold")
 
-        self.assertEqual(grok.reply, raw_reply)
-        self.assertEqual(deepseek.reply, raw_reply)
+        self.assertEqual(grok.reply, raw_reply.rstrip("."))
+        self.assertEqual(deepseek.reply, raw_reply.rstrip("."))
         expected_messages = [{
             "role": "user",
             "content": build_paid_input([self.prompt], "Flirty & bold"),

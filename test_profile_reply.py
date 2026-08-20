@@ -267,6 +267,12 @@ class ProfileParsingTests(unittest.TestCase):
         lines = [line("Finally, a worthy", 200), line("trivia rival appears", 240)]
         self.assertTrue(reply_is_visible(lines, "Finally, a worthy trivia rival appears"))
 
+    def test_reply_visibility_rejects_words_joined_by_a_dropped_space(self):
+        lines = [line("Finally, a worthy triviarival appears", 200)]
+        self.assertFalse(
+            reply_is_visible(lines, "Finally, a worthy trivia rival appears")
+        )
+
     def test_reply_visibility_accepts_visible_composer_prefix(self):
         lines = [line("Finally, a w", 200)]
         self.assertTrue(

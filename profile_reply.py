@@ -518,6 +518,16 @@ def reply_is_visible(lines, reply):
         if line.confidence >= MIN_OCR_CONFIDENCE and normalize_text(line.text)
     ]
     observed = " ".join(observed_lines)
+    target_sequence = target.split()
+    observed_words = set(observed.split())
+    # A dropped space is a real entry failure, even when fuzzy similarity is
+    # otherwise high. Reject any OCR token that joins adjacent target words so
+    # the composer is cleared and the whole reply is entered again.
+    if any(
+        first + second in observed_words
+        for first, second in zip(target_sequence, target_sequence[1:])
+    ):
+        return False
     # Hinge's composer is narrow, so Vision frequently returns only the first
     # visible line of a correctly pasted reply. A distinctive 10-character
     # prefix is sufficient evidence while still avoiding a placeholder match.
@@ -528,7 +538,6 @@ def reply_is_visible(lines, reply):
     ):
         return True
     target_words = {word for word in target.split() if len(word) >= 4}
-    observed_words = set(observed.split())
     matching_words = len(target_words & observed_words)
     required_words = max(2, math.ceil(len(target_words) * 0.45))
     if matching_words >= required_words:
