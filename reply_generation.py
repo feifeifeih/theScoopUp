@@ -56,6 +56,12 @@ API_KEY_ENV_NAMES = (
 )
 LOCAL_FREE_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+OPENAI_COMPATIBLE_CHAT_URLS = {
+    "xai": "https://api.x.ai/v1/chat/completions",
+    "deepseek": "https://api.deepseek.com/chat/completions",
+}
 MAX_REPLY_LENGTH = 140
 PAID_MAX_REPLY_LENGTH = 140
 PAID_HOUSE_RULES = (
@@ -415,11 +421,20 @@ def _png_image_b64(image_bytes):
     return base64.b64encode(bytes(image_bytes)).decode("ascii")
 
 
-def _paid_photo_reply_from_text(text):
+def _prepare_paid_reply(text):
     reply = prepare_reply_for_entry(text, max_length=PAID_MAX_REPLY_LENGTH)
     if not reply:
         raise ReplyGenerationError("The paid model returned no reply text.")
     return reply
+
+
+def _paid_generated_reply(prompts, text):
+    if not prompts:
+        raise ReplyGenerationError("No profile prompts are available to generate from.")
+    return GeneratedReply(
+        prompt_id=prompts[0].prompt_id,
+        reply=_prepare_paid_reply(text),
+    )
 
 
 REPLY_SCHEMA = {
@@ -555,7 +570,7 @@ class ReplyGenerator:
             raise ReplyGenerationError(
                 f"OpenAI photo fallback failed: {error}"
             ) from error
-        return _paid_photo_reply_from_text(extract_openai_response_text(response))
+        return _prepare_paid_reply(extract_openai_response_text(response))
 
 
 class CloudReplyGenerator:
@@ -577,27 +592,56 @@ class CloudReplyGenerator:
     def model_input(self, prompts, tone):
         return build_paid_input(prompts, tone)
 
-    @staticmethod
-    def _generated_reply(prompts, text):
-        try:
-            prompt_id = prompts[0].prompt_id
-        except IndexError as error:
-            raise ReplyGenerationError(
-                "No profile prompts are available to generate from."
-            ) from error
-        reply = prepare_reply_for_entry(text, max_length=PAID_MAX_REPLY_LENGTH)
-        if not reply:
-            raise ReplyGenerationError("The paid model returned no reply text.")
-        return GeneratedReply(prompt_id=prompt_id, reply=reply)
-
-    def _openai_compatible_chat(self, url, prompts, tone):
+    def _anthropic_message(self, content):
         payload = _http_json(
-            url,
+            ANTHROPIC_MESSAGES_URL,
+            {
+                "model": self.model,
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": content}],
+            },
+            {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            self.opener,
+        )
+        try:
+            return payload["content"][0]["text"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ReplyGenerationError(
+                "The paid model returned no reply text."
+            ) from error
+
+    def _google_content(self, parts):
+        payload = _http_json(
+            f"{GOOGLE_MODELS_URL}/{self.model}:generateContent?key={self.api_key}",
+            {
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.4,
+                    "maxOutputTokens": 256,
+                },
+            },
+            {"Content-Type": "application/json"},
+            self.opener,
+        )
+        try:
+            return payload["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ReplyGenerationError(
+                "The paid model returned no reply text."
+            ) from error
+
+    def _openai_compatible_chat(self, provider, content, malformed_message):
+        payload = _http_json(
+            OPENAI_COMPATIBLE_CHAT_URLS[provider],
             {
                 "model": self.model,
                 "temperature": 0.4,
                 "max_tokens": 256,
-                "messages": [{"role": "user", "content": self.model_input(prompts, tone)}],
+                "messages": [{"role": "user", "content": content}],
             },
             {
                 "Authorization": f"Bearer {self.api_key}",
@@ -608,112 +652,27 @@ class CloudReplyGenerator:
         try:
             return payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
-            raise ReplyGenerationError("The paid model returned malformed structured output.") from error
+            raise ReplyGenerationError(malformed_message) from error
 
     def _request(self, prompts, tone):
         provider = self.choice.provider
+        prompt = self.model_input(prompts, tone)
         if provider == "anthropic":
-            payload = _http_json(
-                "https://api.anthropic.com/v1/messages",
-                {
-                    "model": self.model,
-                    "max_tokens": 256,
-                    "messages": [
-                        {"role": "user", "content": self.model_input(prompts, tone)}
-                    ],
-                },
-                {
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                self.opener,
+            text = self._anthropic_message(prompt)
+        elif provider == "google":
+            text = self._google_content([{"text": prompt}])
+        elif provider in OPENAI_COMPATIBLE_CHAT_URLS:
+            text = self._openai_compatible_chat(
+                provider,
+                prompt,
+                "The paid model returned malformed structured output.",
             )
-            try:
-                text = payload["content"][0]["text"]
-            except (KeyError, IndexError, TypeError) as error:
-                raise ReplyGenerationError(
-                    "The paid model returned no reply text."
-                ) from error
-            return self._generated_reply(prompts, text)
-        if provider == "google":
-            payload = _http_json(
-                (
-                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{self.model}:generateContent?key={self.api_key}"
-                ),
-                {
-                    "contents": [
-                        {
-                            "role": "user",
-                            "parts": [{"text": self.model_input(prompts, tone)}],
-                        }
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.4,
-                        "maxOutputTokens": 256,
-                    },
-                },
-                {"Content-Type": "application/json"},
-                self.opener,
-            )
-            try:
-                text = payload["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError, TypeError) as error:
-                raise ReplyGenerationError(
-                    "The paid model returned no reply text."
-                ) from error
-            return self._generated_reply(prompts, text)
-        if provider == "xai":
-            return self._generated_reply(
-                prompts,
-                self._openai_compatible_chat(
-                    "https://api.x.ai/v1/chat/completions", prompts, tone
-                ),
-            )
-        if provider == "deepseek":
-            return self._generated_reply(
-                prompts,
-                self._openai_compatible_chat(
-                    "https://api.deepseek.com/chat/completions",
-                    prompts,
-                    tone,
-                )
-            )
-        raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
+        else:
+            raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
+        return _paid_generated_reply(prompts, text)
 
     def generate(self, prompts, tone):
         return self._request(prompts, tone)
-
-    def _photo_openai_compatible_chat(self, url, image_bytes, tone):
-        b64 = _png_image_b64(image_bytes)
-        payload = _http_json(
-            url,
-            {
-                "model": self.model,
-                "temperature": 0.4,
-                "max_tokens": 256,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": build_paid_photo_input(tone)},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
-                        },
-                    ],
-                }],
-            },
-            {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            self.opener,
-        )
-        try:
-            return payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as error:
-            raise ReplyGenerationError("The paid model returned no reply text.") from error
 
     def generate_photo_pickup_line(self, image_bytes, tone):
         provider = self.choice.provider
@@ -722,78 +681,39 @@ class CloudReplyGenerator:
         if provider == "deepseek":
             raise ReplyGenerationError("DeepSeek does not support photo fallback.")
         if provider == "anthropic":
-            payload = _http_json(
-                "https://api.anthropic.com/v1/messages",
+            text = self._anthropic_message([
                 {
-                    "model": self.model,
-                    "max_tokens": 256,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": b64,
-                                },
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    }],
-                },
-                {
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                self.opener,
-            )
-            try:
-                text = payload["content"][0]["text"]
-            except (KeyError, IndexError, TypeError) as error:
-                raise ReplyGenerationError(
-                    "The paid model returned no reply text."
-                ) from error
-            return _paid_photo_reply_from_text(text)
-        if provider == "google":
-            payload = _http_json(
-                (
-                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{self.model}:generateContent?key={self.api_key}"
-                ),
-                {
-                    "contents": [{
-                        "role": "user",
-                        "parts": [
-                            {"inlineData": {"mimeType": "image/png", "data": b64}},
-                            {"text": prompt},
-                        ],
-                    }],
-                    "generationConfig": {
-                        "temperature": 0.4,
-                        "maxOutputTokens": 256,
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64,
                     },
                 },
-                {"Content-Type": "application/json"},
-                self.opener,
+                {"type": "text", "text": prompt},
+            ])
+        elif provider == "google":
+            text = self._google_content([
+                {"inlineData": {"mimeType": "image/png", "data": b64}},
+                {"text": prompt},
+            ])
+        elif provider == "xai":
+            text = self._openai_compatible_chat(
+                provider,
+                [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}",
+                        },
+                    },
+                ],
+                "The paid model returned no reply text.",
             )
-            try:
-                text = payload["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError, TypeError) as error:
-                raise ReplyGenerationError(
-                    "The paid model returned no reply text."
-                ) from error
-            return _paid_photo_reply_from_text(text)
-        if provider == "xai":
-            return _paid_photo_reply_from_text(
-                self._photo_openai_compatible_chat(
-                    "https://api.x.ai/v1/chat/completions",
-                    image_bytes,
-                    tone,
-                )
-            )
-        raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
+        else:
+            raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
+        return _prepare_paid_reply(text)
 
 
 class OllamaReplyGenerator:

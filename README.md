@@ -1,6 +1,6 @@
 # The Scoop UP
 
-**Version 2.0.0**
+**Version 2.1.0**
 
 A macOS helper that uses **iPhone Mirroring** to automate Hinge and Tinder likes and optional prompt replies.
 
@@ -95,7 +95,7 @@ DEEPSEEK_API_KEY="your-api-key"
 
 The key stays in memory for this session and is not written to disk. Matching environment variables are used to pre-fill the field for that provider.
 
-Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and include OpenAI, Claude, Gemini, Grok, and DeepSeek. Prompt Reply sends the first recognized prompt/answer and selected tone as a compact text request — never photos or screenshots. Paid output is accepted as raw text without local content, grounding, length, or retry checks.
+Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and include OpenAI, Claude, Gemini, Grok, and DeepSeek. Written-prompt replies send the first recognized prompt/answer and selected tone as a compact text request. A cropped profile photo is sent only when the paid photo-fallback rules described below apply. Paid output is accepted as raw text without local content, grounding, or retry checks and is normalized to the 140-character entry limit.
 
 ---
 
@@ -134,6 +134,24 @@ Reply tones: **Playful & clean**, **Flirty & bold**, **Dry & clever**. Local —
 
 ---
 
+## Project structure
+
+Version 2.1.0 separates detection, capture, parsing, and provider code from the UI workflow:
+
+- `main_scoop.py` — Tkinter UI and workflow orchestration
+- `reply_generation.py` — local and paid reply providers
+- `profile_reply.py` — profile scanner orchestration and compatibility exports
+- `profile_vision.py` — Vision OCR and viewport comparison
+- `profile_prompts.py` — prompt parsing, matching, and reply visibility checks
+- `mac_capture.py` — iPhone Mirroring window discovery and ScreenCaptureKit capture
+- `heart_detection.py` — Tinder/Hinge heart-control detection
+- `screen_images.py` — PNG encoding and bounded profile-image crops
+- `prompt_logging.py` — transcript formatting and file naming
+
+The compatibility exports in `main_scoop.py` and `profile_reply.py` keep existing imports working.
+
+---
+
 ## Build a standalone Mac app (optional)
 
 ```bash
@@ -141,13 +159,13 @@ source .venv/bin/activate
 python -m PyInstaller --clean --noconfirm main_scoop.spec
 ```
 
-The app is written to `dist/The Scoop UP V2.0.0.app`.
+The app is written to `dist/The Scoop UP V2.1.0.app`.
 
 If you use a paid model with the standalone build, select the model and import the key in the app. You can still pre-fill the matching field from Terminal:
 
 ```bash
 OPENAI_API_KEY="your-api-key" \
-  "dist/The Scoop UP V2.0.0.app/Contents/MacOS/The Scoop UP V2.0.0"
+  "dist/The Scoop UP V2.1.0.app/Contents/MacOS/The Scoop UP V2.1.0"
 ```
 
 A different `LOCAL_FREE_MODEL` only takes effect in the `.app` after you rebuild. Paid models are chosen in the UI.

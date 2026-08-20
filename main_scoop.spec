@@ -24,7 +24,7 @@ exe = EXE(
     pyz,
     a.scripts,
     [],
-    name='The Scoop UP V2.0.0',
+    name='The Scoop UP V2.1.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -47,19 +47,19 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='The Scoop UP V2.0.0',
+    name='The Scoop UP V2.1.0',
 )
 
 app = BUNDLE(
     coll,
-    name='The Scoop UP V2.0.0.app',
+    name='The Scoop UP V2.1.0.app',
     icon=None,
     bundle_identifier='com.feifeifeih.thescoopup',
     info_plist={
         'CFBundleDisplayName': 'The Scoop UP',
         'CFBundleName': 'The Scoop UP',
-        'CFBundleShortVersionString': '2.0.0',
-        'CFBundleVersion': '2',
+        'CFBundleShortVersionString': '2.1.0',
+        'CFBundleVersion': '2.1.0',
         'NSHighResolutionCapable': True,
     },
 )
