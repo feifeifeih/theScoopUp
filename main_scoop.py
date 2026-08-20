@@ -1,6 +1,7 @@
 import math
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -38,6 +39,7 @@ from reply_generation import (
     ReplyGenerationError,
     ReplyGenerator,
     TONE_INSTRUCTIONS,
+    build_input,
     paid_model_from_selection,
     random_pickup_line,
 )
@@ -93,6 +95,14 @@ SCREEN_RECORDING_SETTINGS_URL = (
 PROMPT_FAILURE_LOG = (
     Path.home() / "Library" / "Logs" / "The Scoop UP" / "prompt_reply_failures.jsonl"
 )
+PROMPT_TRANSCRIPT_DIR = Path.home() / "Desktop"
+
+
+def prompt_transcript_path(when=None, model="unknown-model"):
+    """Desktop text log named Scoop plus the model and local start time."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d %H-%M-%S")
+    safe_model = re.sub(r"[^A-Za-z0-9._-]+", "-", str(model)).strip("-")
+    return PROMPT_TRANSCRIPT_DIR / f"Scoop {safe_model or 'unknown-model'} {stamp}.txt"
 
 
 def format_elapsed_time(seconds):
@@ -105,6 +115,54 @@ def format_elapsed_time(seconds):
     if minutes:
         return f"{minutes}m {seconds}s"
     return f"{seconds}s"
+
+
+def format_prompt_transcript(record):
+    """Render one profile transcript as plain text for the Desktop log."""
+    def section(title, value):
+        text = "" if value is None else str(value).strip()
+        return f"{title}:\n{text or '(none)'}"
+
+    def model_input_text(value):
+        if not value:
+            return "(none)"
+        if isinstance(value, list):
+            chunks = []
+            for item in value:
+                if isinstance(item, dict):
+                    role = str(item.get("role") or "message").strip()
+                    content = str(item.get("content") or "").strip()
+                    chunks.append(f"[{role}]\n{content}")
+                else:
+                    chunks.append(str(item).strip())
+            return "\n\n".join(chunk for chunk in chunks if chunk) or "(none)"
+        return str(value).strip() or "(none)"
+
+    lines = [
+        (
+            f"======== Profile {record.get('rotation')}  "
+            f"{record.get('timestamp')}  {record.get('outcome')}  ========"
+        ),
+        f"Engine: {record.get('engine') or '(none)'}",
+        f"Model: {record.get('model') or '(none)'}",
+        f"Tone: {record.get('tone') or '(none)'}",
+        "",
+        section("Prompt", record.get("profile_prompt")),
+        "",
+        section("Answer", record.get("profile_answer")),
+        "",
+        section("Sent to model", model_input_text(record.get("model_input"))),
+        "",
+    ]
+    if record.get("outcome") == "sent":
+        lines.append(section("Reply sent to profile", record.get("sent_to_profile")))
+    else:
+        lines.append(f"Stage: {record.get('stage') or '(none)'}")
+        lines.append(section("Error", record.get("error")))
+        lines.append("")
+        lines.append(section("Reply (not sent)", record.get("model_reply")))
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def native_autorelease_pool():
@@ -990,6 +1048,9 @@ class ScoopUpApp:
         self._prompt_stage = "unknown"
         self._prompt_failure_can_skip = True
         self.last_prompt_batch = None
+        self._save_transcripts = False
+        self._prompt_transcript = {}
+        self._transcript_log_path = None
 
         tk.Label(
             root,
@@ -1019,6 +1080,7 @@ class ScoopUpApp:
         self.tone_var = tk.StringVar(value="Playful & clean")
         self.rotations_entry = tk.Entry(form, width=14, justify="center")
         self.rotations_entry.insert(0, "20")
+        self.save_transcript_var = tk.BooleanVar(value=False)
 
         api_key_row = tk.Frame(form)
         self.api_key_entry = tk.Entry(
@@ -1054,6 +1116,15 @@ class ScoopUpApp:
             ),
             (tk.Label(form, text="Rotations:"), self.rotations_entry),
         )
+        self._save_transcript_row = (
+            tk.Label(form, text="Save log:"),
+            tk.Checkbutton(
+                form,
+                text="Prompt & reply",
+                variable=self.save_transcript_var,
+                anchor="w",
+            ),
+        )
         self.paid_model_menu = tk.OptionMenu(
             form,
             self.paid_model_var,
@@ -1068,6 +1139,7 @@ class ScoopUpApp:
 
         self.engine_var.trace_add("write", lambda *_args: self._layout_form())
         self.paid_model_var.trace_add("write", lambda *_args: self._layout_form())
+        self.workflow_var.trace_add("write", lambda *_args: self._layout_form())
         self._layout_form()
 
         button_frame = tk.Frame(root)
@@ -1120,6 +1192,8 @@ class ScoopUpApp:
             rows[3:3] = [self._paid_model_row]
             if self._selected_paid_model():
                 rows[4:4] = [self._api_key_row]
+        if self.workflow_var.get() == "Prompt Reply":
+            rows.append(self._save_transcript_row)
         for index, (label, widget) in enumerate(rows):
             label.grid(row=index, column=0, sticky="e", padx=(0, 8), pady=2)
             widget.grid(row=index, column=1, sticky="ew", pady=2)
@@ -1774,9 +1848,16 @@ class ScoopUpApp:
     ):
         self._prompt_failure_can_skip = True
         self._prompt_stage = "scan"
+        self._prompt_transcript = {}
         self.set_status(f"Profile {cycle}: looking for the first written prompt...")
         scan = scanner.scan(ensure_top=ensure_top)
         selected = scan.prompts[0]
+        self._prompt_transcript = {
+            "profile_prompt": selected.prompt,
+            "profile_answer": selected.answer,
+            "model_input": build_input(scan.prompts, tone),
+            "model_reply": None,
+        }
 
         self._prompt_stage = "generate"
         self.set_status(
@@ -1810,6 +1891,7 @@ class ScoopUpApp:
         self._prompt_stage = "generate"
         self.set_status(f"Profile {cycle}: Send Like is positioned; finishing the reply...")
         generated = self._finish_reply_generation(generation, selected)
+        self._prompt_transcript["model_reply"] = generated.reply
         self.set_status(
             f"Profile {cycle}: replying to {selected.prompt!r} with {generated.reply!r}"
         )
@@ -1922,6 +2004,50 @@ class ScoopUpApp:
             PROMPT_FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
             with PROMPT_FAILURE_LOG.open("a", encoding="utf-8") as log_file:
                 log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        return record
+
+    def log_prompt_transcript(
+        self,
+        outcome,
+        batch_id,
+        cycle,
+        tone,
+        engine,
+        model,
+        error=None,
+        stage=None,
+    ):
+        """Append one profile transcript when the save-log checkbox is on."""
+        if not self._save_transcripts:
+            return None
+        snapshot = getattr(self, "_prompt_transcript", None) or {}
+        reply = snapshot.get("model_reply")
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "batch_id": batch_id,
+            "rotation": cycle,
+            "tone": tone,
+            "engine": engine,
+            "model": model,
+            "outcome": outcome,
+            "profile_prompt": snapshot.get("profile_prompt") or None,
+            "profile_answer": snapshot.get("profile_answer") or None,
+            "model_input": snapshot.get("model_input"),
+            "model_reply": reply,
+            "sent_to_profile": reply if outcome == "sent" else None,
+        }
+        if outcome == "failed":
+            record["stage"] = stage
+            record["error"] = str(error) if error is not None else None
+        try:
+            path = getattr(self, "_transcript_log_path", None) or prompt_transcript_path()
+            self._transcript_log_path = path
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as log_file:
+                log_file.write(format_prompt_transcript(record))
         except OSError:
             pass
         return record
@@ -2114,6 +2240,7 @@ class ScoopUpApp:
         engine=PAID_ENGINE,
         paid_model=PAY_MODEL,
         api_key="",
+        save_transcripts=False,
     ):
         started_at = time.monotonic()
         completed = 0
@@ -2121,6 +2248,8 @@ class ScoopUpApp:
         failures = []
         attempted = 0
         batch_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self._save_transcripts = bool(save_transcripts)
+        self._transcript_log_path = None
         try:
             if engine == "Local — Free":
                 generator = OllamaReplyGenerator()
@@ -2133,6 +2262,9 @@ class ScoopUpApp:
                     )
                 else:
                     generator = CloudReplyGenerator(choice, api_key=api_key)
+            model_name = getattr(generator, "model", "") or ""
+            if self._save_transcripts:
+                self._transcript_log_path = prompt_transcript_path(model=model_name)
             if hasattr(generator, "ensure_ready"):
                 self.set_status("Warming up the local reply model...")
                 generator.ensure_ready()
@@ -2142,6 +2274,7 @@ class ScoopUpApp:
                 if not self.is_running:
                     break
                 attempted += 1
+                self._prompt_transcript = {}
                 try:
                     with native_autorelease_pool():
                         reply = self._process_prompt_reply_profile(
@@ -2180,6 +2313,16 @@ class ScoopUpApp:
                         skipped,
                         recovery,
                     )
+                    self.log_prompt_transcript(
+                        "failed",
+                        batch_id,
+                        cycle,
+                        tone,
+                        engine,
+                        model_name,
+                        error=error,
+                        stage=record["stage"],
+                    )
                     failures.append(record)
                     self.set_status(
                         f"Profile {cycle} failed at {record['stage']}: {error}. "
@@ -2197,6 +2340,14 @@ class ScoopUpApp:
 
                 completed += 1
                 rewind_next = False
+                self.log_prompt_transcript(
+                    "sent",
+                    batch_id,
+                    cycle,
+                    tone,
+                    engine,
+                    model_name,
+                )
                 self.set_status(
                     f"Profile {cycle}: sent {reply!r}. Moving to the next profile..."
                 )
@@ -2210,6 +2361,11 @@ class ScoopUpApp:
                 "fallback_likes": fallback_likes,
                 "failures": failures,
                 "log_path": str(PROMPT_FAILURE_LOG),
+                "transcript_log_path": (
+                    str(self._transcript_log_path)
+                    if self._transcript_log_path is not None
+                    else None
+                ),
                 "elapsed_seconds": elapsed_seconds,
             }
             if self.is_running:
@@ -2282,7 +2438,13 @@ class ScoopUpApp:
                 f"Starting Hinge Prompt Reply with {tone} tone using {engine_label}..."
             )
             target = self.run_prompt_reply
-            arguments = (tone, engine, paid_model, api_key)
+            arguments = (
+                tone,
+                engine,
+                paid_model,
+                api_key,
+                bool(self.save_transcript_var.get()),
+            )
         else:
             self.render_status(f"Starting automatic {platform} detection...")
             target = self.run_auto_like

@@ -117,7 +117,7 @@ Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and i
 4. In the control panel:
    - Dating app: **Hinge** (required for a working run)
    - Workflow: **Auto Like** or **Prompt Reply**
-   - For Prompt Reply: reply engine and tone. If you choose **Paid API**, pick a model and import or paste that provider's API key.
+   - For Prompt Reply: reply engine and tone. If you choose **Paid API**, pick a model and import or paste that provider's API key. Optionally check **Save prompt & reply** to append each profile (sent and failed) to a Desktop file named like `Scoop gpt-5-mini 2026-08-19 18-45-30.txt`.
    - Number of rotations (Auto Like = like cycles; Prompt Reply = profiles)
 
 5. Click **Start**. Click **Stop** or press **Esc** to halt.
@@ -157,6 +157,6 @@ A different `LOCAL_FREE_MODEL` only takes effect in the `.app` after you rebuild
 ## Notes
 
 - This tool drives the mirrored iPhone UI. Dating-app rules and account risk are your responsibility.
-- Captured screens stay in process memory for detection; they are not written to disk for Prompt Reply.
+- Captured screens stay in process memory for detection; they are not written to disk for Prompt Reply. If **Save prompt & reply** is checked, prompt text, model input, and generated replies are appended to a Desktop file named like `Scoop gpt-5-mini 2026-08-19 18-45-30.txt`.
 - Local — Free talks only to Ollama on `127.0.0.1`. Paid API is used only when that engine is selected.
 - Coordinates are never reused after a click. If a button or heart cannot be found, nothing is clicked.

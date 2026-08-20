@@ -2,9 +2,12 @@ import unittest
 from contextlib import contextmanager
 import os
 import struct
+import tempfile
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
+from pathlib import Path
 from pynput.keyboard import Key
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +27,7 @@ from main_scoop import (
     is_safe_iphone_action_point,
     first_profile_photo_png,
     parse_openai_api_key,
+    prompt_transcript_path,
 )
 from profile_reply import CapturedPrompt, ProfileScan, ProfileScanError, ScreenText, normalize_text
 from reply_generation import GeneratedReply, PAID_ENGINE, PAY_MODELS
@@ -326,6 +330,9 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         app._prompt_stage = "unknown"
         app._prompt_failure_can_skip = True
         app.last_prompt_batch = None
+        app._save_transcripts = False
+        app._prompt_transcript = {}
+        app._transcript_log_path = Path("/tmp/scoop-unused-transcripts.txt")
         app.root = SimpleNamespace(after=lambda _delay, callback: callback())
         app.start_button = SimpleNamespace(config=lambda **_kwargs: None)
         app.statuses = []
@@ -891,6 +898,63 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(app.last_prompt_batch["attempted"], 6)
         self.assertEqual(app.last_prompt_batch["completed"], 0)
 
+    def test_transcript_log_stays_off_by_default(self):
+        app = self.make_app()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Scoop unused.txt"
+            app.make_profile_scanner = lambda _generator=None: object()
+            app._process_prompt_reply_profile = lambda *_args, **_kwargs: "Trivia first?"
+            with (
+                patch("main_scoop.ReplyGenerator", return_value=SimpleNamespace(model="gpt-5-mini")),
+                patch("main_scoop.prompt_transcript_path", return_value=path),
+            ):
+                app.run_prompt_reply("Playful & clean")
+            self.assertIsNone(app._transcript_log_path)
+            self.assertFalse(path.exists())
+
+    def test_transcript_log_writes_sent_and_failed_profiles(self):
+        app = self.make_app()
+        app.total_rotations = 2
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Scoop gpt-5-mini 2026-08-19 18-45-30.txt"
+            app.make_profile_scanner = lambda _generator=None: object()
+
+            def process(_scanner, _generator, _tone, cycle, ensure_top):
+                app._prompt_transcript = {
+                    "profile_prompt": "Together, we could",
+                    "profile_answer": "Win trivia night",
+                    "model_input": [{"role": "user", "content": "Win trivia night"}],
+                    "model_reply": "Trivia night sounds like a plan.",
+                }
+                if cycle == 2:
+                    raise ProfileScanError("The Send Like control was not confidently detected.")
+                return app._prompt_transcript["model_reply"]
+
+            app._process_prompt_reply_profile = process
+            with (
+                patch("main_scoop.ReplyGenerator", return_value=SimpleNamespace(model="gpt-5-mini")),
+                patch("main_scoop.prompt_transcript_path", return_value=path),
+            ):
+                app.run_prompt_reply("Playful & clean", save_transcripts=True)
+
+            self.assertEqual(app._transcript_log_path, path)
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("Profile 1", text)
+            self.assertIn("  sent  ", text)
+            self.assertIn("Together, we could", text)
+            self.assertIn("Win trivia night", text)
+            self.assertIn("Reply sent to profile:\nTrivia night sounds like a plan.", text)
+            self.assertIn("Profile 2", text)
+            self.assertIn("  failed  ", text)
+            self.assertIn("Reply (not sent)", text)
+            self.assertIn("Send Like", text)
+
+    def test_prompt_transcript_path_uses_scoop_model_and_time(self):
+        when = datetime(2026, 8, 19, 18, 45, 30)
+        path = prompt_transcript_path(when, "qwen3.5:9b")
+        self.assertEqual(path.name, "Scoop qwen3.5-9b 2026-08-19 18-45-30.txt")
+        self.assertEqual(path.parent, Path.home() / "Desktop")
+
     def test_skip_dismisses_sheet_when_send_like_is_offscreen(self):
         app = self.make_app()
         presses = []
@@ -982,6 +1046,13 @@ class PaidEngineUiTests(unittest.TestCase):
 
         self.assertTrue(self.app._api_key_row[1].winfo_manager())
         self.assertIn("anthropic", self.app.status_label.cget("text").lower())
+
+    def test_prompt_reply_shows_save_log_checkbox(self):
+        self.assertFalse(self.app._save_transcript_row[1].winfo_manager())
+        self.app.workflow_var.set("Prompt Reply")
+        self.root.update_idletasks()
+        self.assertTrue(self.app._save_transcript_row[1].winfo_manager())
+        self.assertFalse(self.app.save_transcript_var.get())
 
 
 if __name__ == "__main__":
