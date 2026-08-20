@@ -1,4 +1,4 @@
-"""Paid and local validated funny reply generation."""
+"""Paid raw-text and local validated funny reply generation."""
 
 from dataclasses import dataclass
 import base64
@@ -57,6 +57,11 @@ API_KEY_ENV_NAMES = (
 LOCAL_FREE_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 MAX_REPLY_LENGTH = 140
+PAID_MAX_REPLY_LENGTH = 80
+PAID_HOUSE_RULES = (
+    "Rules: Return ONLY the reply. No quotes, labels, explanation, or extra text. "
+    f"Maximum {PAID_MAX_REPLY_LENGTH} characters. One line only."
+)
 TONE_INSTRUCTIONS = {
     "Playful & clean": "Warm, playful, clever, and clean. No innuendo or appearance jokes.",
     "Flirty & bold": "Confident and flirty with light teasing, but never explicit or insulting.",
@@ -195,17 +200,65 @@ def validate_photo_pickup_line(line, visual_detail):
     return text
 
 
+SMART_QUOTE_MAP = str.maketrans({
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+})
+
+
+def prepare_reply_for_entry(text, max_length=MAX_REPLY_LENGTH):
+    """Shape raw model text for Hinge entry without content validation."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:\w+)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    lines = [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
+    if lines:
+        candidates = [
+            line
+            for line in lines
+            if not re.match(
+                r"^(?:reply|response|here(?:'s| is)|generated reply)\b",
+                line,
+                re.IGNORECASE,
+            )
+        ]
+        text = max(candidates or lines, key=len)
+    text = text.translate(SMART_QUOTE_MAP).strip().strip("\"'")
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_length:
+        text = text[:max_length].rstrip()
+    return text
+
+
+def extract_openai_response_text(response):
+    text = getattr(response, "output_text", None)
+    if text and str(text).strip():
+        return str(text).strip()
+    chunks = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", None) or []:
+            content_type = getattr(content, "type", None)
+            if content_type in {"output_text", "text"}:
+                value = getattr(content, "text", None)
+                if value:
+                    chunks.append(str(value))
+    return "\n".join(chunks).strip()
+
+
 def validate_reply(reply, prompt_ids):
     if not isinstance(reply, GeneratedReply):
         raise ReplyGenerationError("The model returned an invalid reply object.")
-    text = reply.reply.strip().translate(str.maketrans({
-        "\u2013": "-",
-        "\u2014": "-",
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u201c": '"',
-        "\u201d": '"',
-    }))
+    text = reply.reply.strip().translate(SMART_QUOTE_MAP)
     # iPhone Mirroring occasionally drops clipboard paste, while direct
     # keyboard entry is reliable. Remove decorative non-ASCII characters
     # (most commonly model-added emoji) so every accepted reply can use the
@@ -326,6 +379,41 @@ def build_input(prompts, tone):
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def build_paid_input(prompts, tone):
+    """Build the compact, unguarded request used only by paid providers."""
+    if not prompts:
+        raise ReplyGenerationError("No profile prompts are available to generate from.")
+    selected = prompts[0]
+    return (
+        f"Generate a {tone} reply for this dating profile prompt:\n"
+        f"{selected.prompt + " " + selected.answer}\n\n"
+        f"{PAID_HOUSE_RULES}"
+    )
+
+
+def build_paid_photo_input(tone):
+    """Build the compact paid photo request with house rules."""
+    if tone not in TONE_INSTRUCTIONS:
+        raise ReplyGenerationError("Choose a supported humor tone.")
+    return (
+        f"Generate a {tone} reply to this dating profile photo.\n\n"
+        f"{PAID_HOUSE_RULES}"
+    )
+
+
+def _png_image_b64(image_bytes):
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 64:
+        raise ReplyGenerationError("The profile photo crop was empty or invalid.")
+    return base64.b64encode(bytes(image_bytes)).decode("ascii")
+
+
+def _paid_photo_reply_from_text(text):
+    reply = prepare_reply_for_entry(text, max_length=PAID_MAX_REPLY_LENGTH)
+    if not reply:
+        raise ReplyGenerationError("The paid model returned no reply text.")
+    return reply
+
+
 REPLY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -435,42 +523,55 @@ class ReplyGenerator:
                 raise ReplyGenerationError(
                     "Install the OpenAI SDK with: python -m pip install -r requirements.txt"
                 ) from error
-            client = OpenAI(api_key=key, timeout=20.0, max_retries=0)
+            client = OpenAI(api_key=key, timeout=60.0, max_retries=0)
         self.client = client
         self.model = model
+
+    def model_input(self, prompts, tone):
+        return build_paid_input(prompts, tone)
 
     def _request(self, prompts, tone):
         response = self.client.responses.create(
             model=self.model,
             reasoning={"effort": "low"},
-            input=build_input(prompts, tone),
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "hinge_prompt_reply",
-                    "strict": True,
-                    "schema": REPLY_SCHEMA,
-                }
-            },
+            input=self.model_input(prompts, tone),
         )
         try:
-            payload = json.loads(response.output_text)
-            return GeneratedReply(
-                prompt_id=payload["prompt_id"],
-                reply=payload["reply"],
+            reply = prepare_reply_for_entry(
+                extract_openai_response_text(response),
+                max_length=PAID_MAX_REPLY_LENGTH,
             )
-        except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ReplyGenerationError("OpenAI returned malformed structured output.") from error
+        except (AttributeError, IndexError) as error:
+            raise ReplyGenerationError("OpenAI returned no reply text.") from error
+        if not reply:
+            raise ReplyGenerationError("OpenAI returned no reply text.")
+        return GeneratedReply(prompt_id=prompts[0].prompt_id, reply=reply)
 
     def generate(self, prompts, tone):
-        return _generate_with_retries(
-            self._request,
-            prompts,
-            tone,
-            attempts=2,
-            retry_exceptions=Exception,
-            failure_prefix="OpenAI reply generation failed",
-        )
+        return self._request(prompts, tone)
+
+    def generate_photo_pickup_line(self, image_bytes, tone):
+        b64 = _png_image_b64(image_bytes)
+        try:
+            response = self.client.responses.create(
+                model=self.model,
+                reasoning={"effort": "low"},
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": build_paid_photo_input(tone)},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{b64}",
+                        },
+                    ],
+                }],
+            )
+        except Exception as error:
+            raise ReplyGenerationError(
+                f"OpenAI photo fallback failed: {error}"
+            ) from error
+        return _paid_photo_reply_from_text(extract_openai_response_text(response))
 
 
 class CloudReplyGenerator:
@@ -489,28 +590,30 @@ class CloudReplyGenerator:
         self.api_key = key
         self.opener = opener or url_request.urlopen
 
-    def _json_messages(self, prompts, tone):
-        messages = build_input(prompts, tone)
-        system = next(item["content"] for item in messages if item["role"] == "system")
-        user = next(item["content"] for item in messages if item["role"] == "user")
-        user = (
-            f"{user}\nReturn JSON only with keys prompt_id and reply. "
-            f"The reply must be one ASCII line of at most {MAX_REPLY_LENGTH} characters."
-        )
-        return system, user
+    def model_input(self, prompts, tone):
+        return build_paid_input(prompts, tone)
+
+    @staticmethod
+    def _generated_reply(prompts, text):
+        try:
+            prompt_id = prompts[0].prompt_id
+        except IndexError as error:
+            raise ReplyGenerationError(
+                "No profile prompts are available to generate from."
+            ) from error
+        reply = prepare_reply_for_entry(text, max_length=PAID_MAX_REPLY_LENGTH)
+        if not reply:
+            raise ReplyGenerationError("The paid model returned no reply text.")
+        return GeneratedReply(prompt_id=prompt_id, reply=reply)
 
     def _openai_compatible_chat(self, url, prompts, tone):
-        system, user = self._json_messages(prompts, tone)
         payload = _http_json(
             url,
             {
                 "model": self.model,
                 "temperature": 0.4,
                 "max_tokens": 256,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
+                "messages": [{"role": "user", "content": self.model_input(prompts, tone)}],
             },
             {
                 "Authorization": f"Bearer {self.api_key}",
@@ -526,14 +629,14 @@ class CloudReplyGenerator:
     def _request(self, prompts, tone):
         provider = self.choice.provider
         if provider == "anthropic":
-            system, user = self._json_messages(prompts, tone)
             payload = _http_json(
                 "https://api.anthropic.com/v1/messages",
                 {
                     "model": self.model,
                     "max_tokens": 256,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
+                    "messages": [
+                        {"role": "user", "content": self.model_input(prompts, tone)}
+                    ],
                 },
                 {
                     "x-api-key": self.api_key,
@@ -543,44 +646,50 @@ class CloudReplyGenerator:
                 self.opener,
             )
             try:
-                return parse_generated_reply(payload["content"][0]["text"])
+                text = payload["content"][0]["text"]
             except (KeyError, IndexError, TypeError) as error:
                 raise ReplyGenerationError(
-                    "The paid model returned malformed structured output."
+                    "The paid model returned no reply text."
                 ) from error
+            return self._generated_reply(prompts, text)
         if provider == "google":
-            system, user = self._json_messages(prompts, tone)
             payload = _http_json(
                 (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{self.model}:generateContent?key={self.api_key}"
                 ),
                 {
-                    "systemInstruction": {"parts": [{"text": system}]},
-                    "contents": [{"role": "user", "parts": [{"text": user}]}],
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": self.model_input(prompts, tone)}],
+                        }
+                    ],
                     "generationConfig": {
                         "temperature": 0.4,
                         "maxOutputTokens": 256,
-                        "responseMimeType": "application/json",
                     },
                 },
                 {"Content-Type": "application/json"},
                 self.opener,
             )
             try:
-                return parse_generated_reply(
-                    payload["candidates"][0]["content"]["parts"][0]["text"]
-                )
+                text = payload["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError, TypeError) as error:
                 raise ReplyGenerationError(
-                    "The paid model returned malformed structured output."
+                    "The paid model returned no reply text."
                 ) from error
+            return self._generated_reply(prompts, text)
         if provider == "xai":
-            return parse_generated_reply(
-                self._openai_compatible_chat("https://api.x.ai/v1/chat/completions", prompts, tone)
+            return self._generated_reply(
+                prompts,
+                self._openai_compatible_chat(
+                    "https://api.x.ai/v1/chat/completions", prompts, tone
+                ),
             )
         if provider == "deepseek":
-            return parse_generated_reply(
+            return self._generated_reply(
+                prompts,
                 self._openai_compatible_chat(
                     "https://api.deepseek.com/chat/completions",
                     prompts,
@@ -590,14 +699,117 @@ class CloudReplyGenerator:
         raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
 
     def generate(self, prompts, tone):
-        return _generate_with_retries(
-            self._request,
-            prompts,
-            tone,
-            attempts=2,
-            retry_exceptions=Exception,
-            failure_prefix=f"{self.choice.provider_title} reply generation failed",
+        return self._request(prompts, tone)
+
+    def _photo_openai_compatible_chat(self, url, image_bytes, tone):
+        b64 = _png_image_b64(image_bytes)
+        payload = _http_json(
+            url,
+            {
+                "model": self.model,
+                "temperature": 0.4,
+                "max_tokens": 256,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": build_paid_photo_input(tone)},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        },
+                    ],
+                }],
+            },
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            self.opener,
         )
+        try:
+            return payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ReplyGenerationError("The paid model returned no reply text.") from error
+
+    def generate_photo_pickup_line(self, image_bytes, tone):
+        provider = self.choice.provider
+        b64 = _png_image_b64(image_bytes)
+        prompt = build_paid_photo_input(tone)
+        if provider == "deepseek":
+            raise ReplyGenerationError("DeepSeek does not support photo fallback.")
+        if provider == "anthropic":
+            payload = _http_json(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "model": self.model,
+                    "max_tokens": 256,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": b64,
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                },
+                {
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                self.opener,
+            )
+            try:
+                text = payload["content"][0]["text"]
+            except (KeyError, IndexError, TypeError) as error:
+                raise ReplyGenerationError(
+                    "The paid model returned no reply text."
+                ) from error
+            return _paid_photo_reply_from_text(text)
+        if provider == "google":
+            payload = _http_json(
+                (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{self.model}:generateContent?key={self.api_key}"
+                ),
+                {
+                    "contents": [{
+                        "role": "user",
+                        "parts": [
+                            {"inlineData": {"mimeType": "image/png", "data": b64}},
+                            {"text": prompt},
+                        ],
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.4,
+                        "maxOutputTokens": 256,
+                    },
+                },
+                {"Content-Type": "application/json"},
+                self.opener,
+            )
+            try:
+                text = payload["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError) as error:
+                raise ReplyGenerationError(
+                    "The paid model returned no reply text."
+                ) from error
+            return _paid_photo_reply_from_text(text)
+        if provider == "xai":
+            return _paid_photo_reply_from_text(
+                self._photo_openai_compatible_chat(
+                    "https://api.x.ai/v1/chat/completions",
+                    image_bytes,
+                    tone,
+                )
+            )
+        raise ReplyGenerationError(f"Unsupported paid provider: {provider}")
 
 
 class OllamaReplyGenerator:

@@ -341,7 +341,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         app.fresh_capture = lambda: SimpleNamespace(
             window=SimpleNamespace(left=0, top=0, width=400, height=800)
         )
-        app.paste_reply = lambda _reply: None
+        app.paste_reply = lambda _reply, defer_restore=False: None
         app.type_reply = lambda _reply: None
         app.clicks = []
         app.click_once = lambda point: app.clicks.append(point)
@@ -509,6 +509,96 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertEqual(photo_calls[0][1], "Playful & clean")
         self.assertEqual(app.clicks.count(heart_point), 3)
 
+    def test_fallback_skips_photo_when_use_photo_generator_false(self):
+        app = self.make_app()
+        capture = make_capture(make_frame(400, 800, [], (25, 100, 180)))
+        heart_point = (300, 600)
+        app.fresh_capture = lambda: capture
+        app.heart_detector = SimpleNamespace(
+            find_all=lambda _capture, _platform: [(heart_point, 0.95)]
+        )
+        app.wait_for_comment_field = lambda attempts=3: None
+        scanner = SimpleNamespace(scroll_to_top=lambda: None)
+        photo_calls = []
+        generator = SimpleNamespace(
+            generate_photo_pickup_line=lambda image, tone: photo_calls.append((image, tone)),
+        )
+
+        with (
+            patch("main_scoop.find_send_priority_like", return_value=(None, 0.0, "")),
+            patch("main_scoop.viewport_similarity", return_value=1.0),
+        ):
+            ScoopUpApp.fallback_regular_like(
+                app,
+                scanner,
+                1,
+                photo_generator=generator,
+                tone="Playful & clean",
+                use_photo_generator=False,
+            )
+
+        self.assertEqual(photo_calls, [])
+
+    def test_fallback_hearts_include_low_photo_hearts(self):
+        app = self.make_app()
+        capture = make_capture(make_frame(400, 800, [], (25, 100, 180)))
+        low_photo_heart = (300, 744)
+        app.heart_detector = SimpleNamespace(
+            find_all=lambda _capture, _platform: [(low_photo_heart, 0.88)]
+        )
+        self.assertEqual(app._hinge_hearts_in_band(capture), [])
+        self.assertEqual(len(app._fallback_hearts_in_band(capture)), 1)
+
+    def test_paid_scan_failure_enables_photo_fallback(self):
+        app = self.make_app()
+        app.make_profile_scanner = lambda _generator=None: object()
+        captured = {}
+
+        def fallback(*_args, **kwargs):
+            captured.update(kwargs)
+            return False
+
+        def fail_scan(*_args, **_kwargs):
+            app._prompt_stage = "scan"
+            raise ProfileScanError(
+                "No readable Hinge prompt and answer pairs were found."
+            )
+
+        app._process_prompt_reply_profile = fail_scan
+        app.fallback_regular_like = fallback
+        with patch(
+            "main_scoop.ReplyGenerator",
+            return_value=SimpleNamespace(model="gpt-5-mini"),
+        ):
+            app.run_prompt_reply("Playful & clean", engine="Paid API")
+
+        self.assertTrue(captured.get("use_photo_generator"))
+
+    def test_paid_send_failure_skips_photo_fallback(self):
+        app = self.make_app()
+        app.make_profile_scanner = lambda _generator=None: object()
+        captured = {}
+
+        def fallback(*_args, **kwargs):
+            captured.update(kwargs)
+            return False
+
+        def fail_send(*_args, **_kwargs):
+            app._prompt_stage = "enter_reply"
+            raise ProfileScanError(
+                "The entered reply could not be verified; nothing was sent."
+            )
+
+        app._process_prompt_reply_profile = fail_send
+        app.fallback_regular_like = fallback
+        with patch(
+            "main_scoop.ReplyGenerator",
+            return_value=SimpleNamespace(model="gpt-5-mini"),
+        ):
+            app.run_prompt_reply("Playful & clean", engine="Paid API")
+
+        self.assertFalse(captured.get("use_photo_generator"))
+
     def test_prompt_heart_hands_off_when_composer_starts_offscreen(self):
         app = self.make_app()
         _scan, scanner, _generator = self.make_scan()
@@ -523,7 +613,7 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertIsNone(point)
         self.assertEqual(app.clicks.count(selected.heart_point), 3)
 
-    def test_dropped_paste_is_retried_until_composer_verifies(self):
+    def test_ascii_local_reply_is_direct_typed_until_composer_verifies(self):
         app = self.make_app()
         attempts = []
         app.paste_reply = attempts.append
@@ -545,6 +635,29 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
         self.assertIs(result_capture, capture)
         self.assertEqual(attempts, [])
         self.assertEqual(typed, ["A grounded reply"] * 3)
+
+    def test_paid_prepared_reply_is_direct_typed_until_composer_verifies(self):
+        app = self.make_app()
+        pasted = []
+        app.paste_reply = lambda reply, defer_restore=False: pasted.append(reply)
+        typed = []
+        app.type_reply = typed.append
+        capture = SimpleNamespace(window=SimpleNamespace(height=800))
+        app.verify_reply_entry = lambda *_args, **_kwargs: (capture, [])
+
+        with patch(
+            "main_scoop.reply_is_visible_near",
+            side_effect=[False, True],
+        ):
+            result_capture, _ = app.enter_reply(
+                (200, 500),
+                "Trivia rivals first",
+                800,
+            )
+
+        self.assertIs(result_capture, capture)
+        self.assertEqual(pasted, [])
+        self.assertEqual(typed, ["Trivia rivals first"] * 2)
 
     def test_reply_verification_uses_short_waits_only_between_attempts(self):
         app = self.make_app()
@@ -594,6 +707,9 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
                 (100, 200),
                 (100, 200),
                 (100, 200),
+                comment_line.center,
+                comment_line.center,
+                comment_line.center,
                 comment_line.center,
                 comment_line.center,
                 comment_line.center,
@@ -923,7 +1039,11 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
                 app._prompt_transcript = {
                     "profile_prompt": "Together, we could",
                     "profile_answer": "Win trivia night",
-                    "model_input": [{"role": "user", "content": "Win trivia night"}],
+                    "model_input": (
+                        "Generate a Playful & clean reply for this dating profile:\n"
+                        "Together, we could\n"
+                        "Win trivia night"
+                    ),
                     "model_reply": "Trivia night sounds like a plan.",
                 }
                 if cycle == 2:
@@ -939,10 +1059,24 @@ class PromptReplyOrchestrationTests(unittest.TestCase):
 
             self.assertEqual(app._transcript_log_path, path)
             text = path.read_text(encoding="utf-8")
+            self.assertIn("The Scoop UP Prompt Reply Log", text)
+            self.assertIn("Engine: Paid API", text)
+            self.assertIn("Model: gpt-5-mini", text)
+            self.assertIn("Tone: Playful & clean", text)
+            self.assertEqual(text.count("Engine:"), 1)
+            self.assertEqual(text.count("Model: gpt-5-mini"), 1)
+            self.assertEqual(text.count("Tone: Playful & clean"), 1)
             self.assertIn("Profile 1", text)
             self.assertIn("  sent  ", text)
             self.assertIn("Together, we could", text)
             self.assertIn("Win trivia night", text)
+            self.assertIn(
+                "Sent to model:\n"
+                "Generate a Playful & clean reply for this dating profile:\n"
+                "Together, we could\n"
+                "Win trivia night",
+                text,
+            )
             self.assertIn("Reply sent to profile:\nTrivia night sounds like a plan.", text)
             self.assertIn("Profile 2", text)
             self.assertIn("  failed  ", text)

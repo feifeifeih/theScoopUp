@@ -51,6 +51,18 @@ def is_paid_engine(engine):
     return engine in {PAID_ENGINE, "OpenAI API"}
 
 
+def is_no_prompt_scan_failure(stage, error):
+    return stage == "scan" and "No readable Hinge prompt" in str(error)
+
+
+def paid_photo_fallback_enabled(engine, stage, error):
+    if engine == "Local — Free":
+        return True
+    if is_paid_engine(engine):
+        return is_no_prompt_scan_failure(stage, error)
+    return False
+
+
 def parse_openai_api_key(text, env_names=API_KEY_ENV_NAMES):
     """Read an API key from pasted text or a small env/key file."""
     if not isinstance(text, str):
@@ -117,6 +129,20 @@ def format_elapsed_time(seconds):
     return f"{seconds}s"
 
 
+def format_prompt_transcript_header(*, batch_id, tone, engine, model, when=None):
+    """Render batch metadata once at the top of a transcript log file."""
+    stamp = (when or datetime.now(timezone.utc)).isoformat()
+    return "\n".join([
+        "======== The Scoop UP Prompt Reply Log ========",
+        f"Batch: {batch_id}",
+        f"Started: {stamp}",
+        f"Engine: {engine or '(none)'}",
+        f"Model: {model or '(none)'}",
+        f"Tone: {tone or '(none)'}",
+        "",
+    ]) + "\n"
+
+
 def format_prompt_transcript(record):
     """Render one profile transcript as plain text for the Desktop log."""
     def section(title, value):
@@ -143,10 +169,6 @@ def format_prompt_transcript(record):
             f"======== Profile {record.get('rotation')}  "
             f"{record.get('timestamp')}  {record.get('outcome')}  ========"
         ),
-        f"Engine: {record.get('engine') or '(none)'}",
-        f"Model: {record.get('model') or '(none)'}",
-        f"Tone: {record.get('tone') or '(none)'}",
-        "",
         section("Prompt", record.get("profile_prompt")),
         "",
         section("Answer", record.get("profile_answer")),
@@ -1380,23 +1402,23 @@ class ScoopUpApp:
         self.keyboard.release(Key.backspace)
         self.interruptible_wait(0.15)
 
-    def paste_reply(self, reply):
+    def paste_reply(self, reply, *, defer_restore=False):
         saved = self.clipboard.snapshot()
-        try:
-            self.clear_reply_field()
-            self.clipboard.set_text(reply)
-            # Give iPhone Mirroring time to observe the new pasteboard change
-            # before requesting paste; otherwise it can reuse the prior value.
-            self.interruptible_wait(0.3)
-            self.keyboard.press(Key.cmd)
-            self.keyboard.press("v")
-            self.keyboard.release("v")
-            self.keyboard.release(Key.cmd)
-            # iPhone Mirroring consumes pasteboard data asynchronously. Keep
-            # our temporary clipboard value alive until the phone has read it.
-            self.interruptible_wait(0.8)
-        finally:
+        self.clear_reply_field()
+        self.clipboard.set_text(reply)
+        # Give iPhone Mirroring time to observe the new pasteboard change
+        # before requesting paste; otherwise it can reuse the prior value.
+        self.interruptible_wait(0.4)
+        self.keyboard.press(Key.cmd)
+        self.keyboard.press("v")
+        self.keyboard.release("v")
+        self.keyboard.release(Key.cmd)
+        # iPhone Mirroring consumes pasteboard data asynchronously. Keep
+        # our temporary clipboard value alive until the phone has read it.
+        self.interruptible_wait(1.2)
+        if not defer_restore:
             self.clipboard.restore(saved)
+        return saved
 
     def type_reply(self, reply):
         if not reply.isascii():
@@ -1500,31 +1522,44 @@ class ScoopUpApp:
             "Send Like could not be moved into the top 85%; nothing was clicked."
         )
 
-    def enter_reply(self, comment_point, reply, window_height, attempts=3):
-        """Focus, replace, paste, and composer-verify with bounded retries."""
+    def enter_reply(
+        self,
+        comment_point,
+        reply,
+        window_height,
+        attempts=3,
+    ):
+        """Focus, replace, enter, and composer-verify with bounded retries."""
         last_capture = None
         last_lines = []
-        for attempt in range(1, attempts + 1):
-            self.set_status(f"Entering generated reply ({attempt}/{attempts})...")
-            self.click_once(comment_point)
-            self.interruptible_wait(0.2)
-            if reply.isascii():
-                self.type_reply(reply)
-            else:
-                self.paste_reply(reply)
-            self.interruptible_wait(0.12)
-            last_capture, last_lines = self.verify_reply_entry(
-                reply,
-                comment_point,
-                window_height,
-            )
-            if reply_is_visible_near(
-                last_lines,
-                reply,
-                comment_point,
-                window_height,
-            ):
-                return last_capture, last_lines
+        saved_clipboard = None
+        try:
+            for attempt in range(1, attempts + 1):
+                self.set_status(f"Entering generated reply ({attempt}/{attempts})...")
+                self.click_once(comment_point)
+                self.interruptible_wait(0.15)
+                self.click_once(comment_point)
+                self.interruptible_wait(0.35)
+                if reply.isascii():
+                    self.type_reply(reply)
+                else:
+                    saved_clipboard = self.paste_reply(reply, defer_restore=True)
+                self.interruptible_wait(0.2)
+                last_capture, last_lines = self.verify_reply_entry(
+                    reply,
+                    comment_point,
+                    window_height,
+                )
+                if reply_is_visible_near(
+                    last_lines,
+                    reply,
+                    comment_point,
+                    window_height,
+                ):
+                    return last_capture, last_lines
+        finally:
+            if saved_clipboard is not None:
+                self.clipboard.restore(saved_clipboard)
         return last_capture, last_lines
 
     def wait_for_comment_field(self, attempts=6):
@@ -1852,10 +1887,11 @@ class ScoopUpApp:
         self.set_status(f"Profile {cycle}: looking for the first written prompt...")
         scan = scanner.scan(ensure_top=ensure_top)
         selected = scan.prompts[0]
+        model_input = getattr(generator, "model_input", build_input)
         self._prompt_transcript = {
             "profile_prompt": selected.prompt,
             "profile_answer": selected.answer,
-            "model_input": build_input(scan.prompts, tone),
+            "model_input": model_input(scan.prompts, tone),
             "model_reply": None,
         }
 
@@ -2061,12 +2097,47 @@ class ScoopUpApp:
             and score >= SEND_LIKE_MIN_SCORE
         ]
 
+    def _fallback_hearts_in_band(self, capture):
+        """Photo likes place hearts low on the card; allow a wider band than prompts."""
+        window = capture.window
+        hearts = []
+        for point, score in self.heart_detector.find_all(capture, "Hinge"):
+            relative_y = (point[1] - window.top) / window.height
+            if (
+                0.12 <= relative_y <= 0.94
+                and score >= SEND_LIKE_MIN_SCORE
+                and is_safe_iphone_action_point(
+                    capture,
+                    point,
+                    bottom_limit=0.94,
+                )
+            ):
+                hearts.append((point, score))
+        return hearts
+
+    def _capture_fallback_heart(self, scanner):
+        """Scroll until a Hinge heart is in the safe middle band for clicking."""
+        scanner.scroll_to_top()
+        self.interruptible_wait(0.3)
+        capture = self.fresh_capture()
+        hearts = self._fallback_hearts_in_band(capture)
+        for adjust in range(7):
+            if hearts:
+                return capture, min(hearts, key=lambda item: item[0][1])
+            if adjust < 6:
+                self.scroll_profile("up" if adjust % 2 == 0 else "down_small")
+                self.interruptible_wait(0.35)
+                capture = self.fresh_capture()
+                hearts = self._fallback_hearts_in_band(capture)
+        return capture, None
+
     def fallback_regular_like(
         self,
         scanner,
         cycle,
         photo_generator=None,
         tone="Playful & clean",
+        use_photo_generator=True,
     ):
         """Recover a failed prompt with a verified clean pickup-line comment."""
         pickup_line = None
@@ -2076,31 +2147,40 @@ class ScoopUpApp:
         capture = self.fresh_capture()
         send_point, _, _ = find_send_priority_like(capture)
         if send_point is not None:
-            # Remove any partially entered comment before leaving the failed
-            # inline composer. This prevents a stale draft from being sent by
-            # the regular-like fallback.
-            self.click_once(comment_point_from_send(capture.window, send_point))
-            self.interruptible_wait(0.25)
-            self.clear_reply_field()
+            # Dismiss any leftover like sheet so hearts and photos are visible
+            # again before opening a fresh photo-grounded comment.
+            self.keyboard.press(Key.esc)
+            self.keyboard.release(Key.esc)
+            self.interruptible_wait(0.5)
 
-        scanner.scroll_to_top()
-        capture = self.fresh_capture()
-        hearts = self._hinge_hearts_in_band(capture)
-        if not hearts:
+        capture, heart_match = self._capture_fallback_heart(scanner)
+        if heart_match is None:
             return False
-        heart_point, _ = min(hearts, key=lambda item: item[0][1])
+        heart_point, _ = heart_match
 
-        if pickup_line is None and hasattr(photo_generator, "generate_photo_pickup_line"):
+        if (
+            pickup_line is None
+            and use_photo_generator
+            and hasattr(photo_generator, "generate_photo_pickup_line")
+        ):
             try:
-                self.set_status(
-                    f"Profile {cycle}: generating a line from the first photo locally..."
-                )
+                model_name = getattr(photo_generator, "model", "") or "paid model"
+                if hasattr(photo_generator, "ensure_ready"):
+                    photo_status = (
+                        f"Profile {cycle}: generating a line from the first photo locally..."
+                    )
+                else:
+                    photo_status = (
+                        f"Profile {cycle}: generating a line from the first photo "
+                        f"with {model_name}..."
+                    )
+                self.set_status(photo_status)
                 photo_png = first_profile_photo_png(capture, heart_point)
                 pickup_line = photo_generator.generate_photo_pickup_line(photo_png, tone)
                 self.set_status(
                     f"Profile {cycle}: photo-grounded fallback ready: {pickup_line!r}"
                 )
-            except (ReplyGenerationError, OSError, RuntimeError) as error:
+            except Exception as error:
                 pickup_line = random_pickup_line()
                 self.set_status(
                     f"Profile {cycle}: photo fallback unavailable ({error}); "
@@ -2109,27 +2189,19 @@ class ScoopUpApp:
         elif pickup_line is None:
             pickup_line = random_pickup_line()
 
-        # Image generation can take several seconds. Re-capture and require the
-        # same viewport before using any previously observed profile state.
-        current_capture = self.fresh_capture()
-        if viewport_similarity(
-            [],
-            getattr(capture, "frame", None),
-            [],
-            getattr(current_capture, "frame", None),
-        ) < 0.90:
+        # Re-sync after generation; paid API calls can take long enough for the
+        # viewport to drift and hearts to leave the safe click band.
+        current_capture, heart_match = self._capture_fallback_heart(scanner)
+        if heart_match is None:
             return False
-        current_hearts = self._hinge_hearts_in_band(current_capture)
-        if not current_hearts:
-            return False
-        heart_point, _ = min(current_hearts, key=lambda item: item[0][1])
+        heart_point, _ = heart_match
         for click_index in range(3):
             self.click_once(heart_point)
             if click_index < 2:
                 self.interruptible_wait(0.12)
-        self.interruptible_wait(0.55)
+        self.interruptible_wait(0.85)
 
-        comment_point = self.wait_for_comment_field(attempts=3)
+        comment_point = self.wait_for_comment_field(attempts=6)
         if comment_point is None:
             return False
         try:
@@ -2172,19 +2244,20 @@ class ScoopUpApp:
                 f"({send_attempt}/3)..."
             )
             self.click_once(send_point)
-            before_lines = dialog_lines
-            before_frame = getattr(dialog_capture, "frame", None)
+            _before_lines = dialog_lines
+            _before_frame = getattr(dialog_capture, "frame", None)
 
             def classify_fallback(capture, lines):
                 after_send, _, _ = find_send_priority_like(capture, lines)
                 if after_send is None:
-                    similarity = viewport_similarity(
-                        before_lines,
-                        before_frame,
-                        lines,
-                        getattr(capture, "frame", None),
-                    )
-                    return "succeeded" if similarity < 0.92 else "failed"
+                    return "succeeded"
+                if not reply_is_visible_near(
+                    lines,
+                    pickup_line,
+                    comment_point,
+                    dialog_capture.window.height,
+                ):
+                    return "succeeded"
                 return "retry"
 
             _after_capture, _after_lines, outcome = self._observe_after_send_click(
@@ -2265,6 +2338,20 @@ class ScoopUpApp:
             model_name = getattr(generator, "model", "") or ""
             if self._save_transcripts:
                 self._transcript_log_path = prompt_transcript_path(model=model_name)
+                try:
+                    header_path = Path(self._transcript_log_path)
+                    header_path.parent.mkdir(parents=True, exist_ok=True)
+                    with header_path.open("w", encoding="utf-8") as log_file:
+                        log_file.write(
+                            format_prompt_transcript_header(
+                                batch_id=batch_id,
+                                tone=tone,
+                                engine=engine,
+                                model=model_name,
+                            )
+                        )
+                except OSError:
+                    pass
             if hasattr(generator, "ensure_ready"):
                 self.set_status("Warming up the local reply model...")
                 generator.ensure_ready()
@@ -2291,12 +2378,23 @@ class ScoopUpApp:
                     fallback_sent = False
                     recovery = "uncertain_send"
                     if self.is_running and self._prompt_failure_can_skip:
+                        if engine == "Local — Free":
+                            use_photo_generator = True
+                        elif is_paid_engine(engine):
+                            use_photo_generator = paid_photo_fallback_enabled(
+                                engine,
+                                self._prompt_stage,
+                                error,
+                            )
+                        else:
+                            use_photo_generator = False
                         with native_autorelease_pool():
                             fallback_sent = self.fallback_regular_like(
                                 scanner,
                                 cycle,
                                 photo_generator=generator,
                                 tone=tone,
+                                use_photo_generator=use_photo_generator,
                             )
                         if fallback_sent:
                             fallback_likes += 1

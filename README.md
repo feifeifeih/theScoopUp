@@ -95,7 +95,7 @@ DEEPSEEK_API_KEY="your-api-key"
 
 The key stays in memory for this session and is not written to disk. Matching environment variables are used to pre-fill the field for that provider.
 
-Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and include OpenAI, Claude, Gemini, Grok, and DeepSeek. Prompt Reply sends recognized prompt/answer text only — never photos or screenshots.
+Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and include OpenAI, Claude, Gemini, Grok, and DeepSeek. Prompt Reply sends the first recognized prompt/answer and selected tone as a compact text request — never photos or screenshots. Paid output is accepted as raw text without local content, grounding, length, or retry checks.
 
 ---
 
@@ -128,9 +128,9 @@ Available paid models are listed in `reply_generation.py` as `PAID_MODELS` and i
 
 **Auto Like** finds Hinge’s like button, clicks it, then looks for **Send Like** / **Send Priority Like** and clicks that. If a target is not detected, that cycle is skipped.
 
-**Prompt Reply** (Hinge only) finds the first written prompt on a profile, generates a short reply, pastes it only after on-screen verification, then sends. If prompt reply fails, it can fall back to a photo-grounded pickup line or a built-in clean line — then skip to the next profile when recovery fails.
+**Prompt Reply** (Hinge only) finds the first written prompt on a profile, generates a short reply, pastes it only after on-screen verification, then sends. If prompt reply fails, it can fall back to a photo-grounded pickup line or a built-in clean line — then skip to the next profile when recovery fails. **Local — Free** can use local vision on any recoverable failure. **Paid API** sends the first profile photo to the selected vision-capable model (OpenAI, Claude, Gemini, Grok) with the same house rules only when scan finds no prompt; other paid failures use built-in pickup lines only.
 
-Reply tones: **Playful & clean**, **Flirty & bold**, **Dry & clever**. Replies are capped at 140 characters and checked locally before send.
+Reply tones: **Playful & clean**, **Flirty & bold**, **Dry & clever**. Local — Free replies are capped at 140 characters and checked locally. Paid API replies are used as returned, while the app still verifies the open Hinge prompt and pasted text before clicking Send.
 
 ---
 

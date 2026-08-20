@@ -13,6 +13,9 @@ from reply_generation import (
     ReplyGenerator,
     TONE_INSTRUCTIONS,
     build_input,
+    build_paid_input,
+    build_paid_photo_input,
+    prepare_reply_for_entry,
     paid_model_from_selection,
     random_pickup_line,
     validate_fallback_pickup_line,
@@ -130,24 +133,133 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertIn("do not respond to the prompt heading alone", messages[0]["content"])
         self.assertIn("reply directly to that answer", messages[1]["content"])
 
-    def test_uses_responses_structured_output(self):
-        client = FakeClient([json.dumps({
-            "prompt_id": "prompt-1",
-            "reply": "I bring obscure trivia facts and dangerously confident guesses.",
-        })])
+    def test_paid_input_is_compact_and_uses_only_the_first_prompt(self):
+        second = CapturedPrompt(
+            "prompt-2",
+            "My simple pleasures",
+            "Sunday coffee",
+            0,
+            0,
+            (3, 4),
+            0.9,
+        )
 
-        result = ReplyGenerator(client=client).generate([self.prompt], "Dry & clever")
+        model_input = build_paid_input(
+            [self.prompt, second],
+            "Dry & clever",
+        )
+
+        self.assertEqual(
+            model_input,
+            "Generate a Dry & clever reply for this dating profile prompt:\n"
+            "Together, we could\n"
+            "Dominate pub trivia\n\n"
+            "Rules: Return ONLY the reply. No quotes, labels, explanation, or extra text. "
+            "Maximum 80 characters. One line only.",
+        )
+        self.assertNotIn("Sunday coffee", model_input)
+        self.assertIn("Rules: Return ONLY the reply", model_input)
+
+    def test_paid_photo_input_includes_house_rules(self):
+        text = build_paid_photo_input("Playful & clean")
+        self.assertIn("dating profile photo", text)
+        self.assertIn("Rules: Return ONLY the reply", text)
+        self.assertIn("Maximum 80 characters", text)
+
+    def test_openai_photo_pickup_sends_image_and_house_rules(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"x" * 80
+        client = FakeClient(["That surfboard looks like trouble."])
+
+        line = ReplyGenerator(client=client).generate_photo_pickup_line(
+            image,
+            "Playful & clean",
+        )
+
+        self.assertIn("surfboard", line.lower())
+        call = client.responses.calls[0]
+        content = call["input"][0]["content"]
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertIn("Rules: Return ONLY the reply", content[0]["text"])
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
+    def test_paid_cloud_photo_providers_send_image_and_house_rules(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"x" * 80
+        raw_reply = "That orange cat deserves its own fan club."
+        anthropic = FakeOpener([{"content": [{"text": raw_reply}]}])
+        gemini = FakeOpener([{
+            "candidates": [{"content": {"parts": [{"text": raw_reply}]}}],
+        }])
+        grok = FakeOpener([{
+            "choices": [{"message": {"content": raw_reply}}],
+        }])
+
+        claude_line = CloudReplyGenerator(
+            paid_model_from_selection("Claude Sonnet 4.6"),
+            api_key="sk-ant-test",
+            opener=anthropic,
+        ).generate_photo_pickup_line(image, "Playful & clean")
+        flash_line = CloudReplyGenerator(
+            paid_model_from_selection("Gemini 2.5 Flash"),
+            api_key="gemini-test",
+            opener=gemini,
+        ).generate_photo_pickup_line(image, "Playful & clean")
+        grok_line = CloudReplyGenerator(
+            paid_model_from_selection("Grok 4"),
+            api_key="xai-test",
+            opener=grok,
+        ).generate_photo_pickup_line(image, "Flirty & bold")
+
+        self.assertIn("orange cat", claude_line)
+        self.assertIn("orange cat", flash_line)
+        self.assertIn("orange cat", grok_line)
+
+        anthropic_payload = json.loads(anthropic.requests[0][0].data)
+        self.assertEqual(anthropic_payload["messages"][0]["content"][0]["type"], "image")
+        self.assertIn("Rules: Return ONLY the reply", anthropic_payload["messages"][0]["content"][1]["text"])
+
+        gemini_payload = json.loads(gemini.requests[0][0].data)
+        self.assertIn("inlineData", gemini_payload["contents"][0]["parts"][0])
+        self.assertIn("Rules: Return ONLY the reply", gemini_payload["contents"][0]["parts"][1]["text"])
+
+        grok_payload = json.loads(grok.requests[0][0].data)
+        self.assertEqual(grok_payload["messages"][0]["content"][1]["type"], "image_url")
+
+    def test_deepseek_photo_fallback_is_unsupported(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"x" * 80
+        with self.assertRaisesRegex(ReplyGenerationError, "DeepSeek does not support"):
+            CloudReplyGenerator(
+                paid_model_from_selection("DeepSeek Chat"),
+                api_key="deepseek-test",
+                opener=FakeOpener([]),
+            ).generate_photo_pickup_line(image, "Playful & clean")
+
+    def test_openai_uses_prepared_single_line_text_with_direct_typing(self):
+        raw_reply = "  Here's a reply:\nTrivia rivals first 🍟\n"
+        client = FakeClient([raw_reply])
+
+        result = ReplyGenerator(client=client).generate(
+            [self.prompt],
+            "Dry & clever",
+        )
 
         self.assertEqual(result.prompt_id, "prompt-1")
+        self.assertEqual(result.reply, "Trivia rivals first")
         call = client.responses.calls[0]
         self.assertEqual(call["model"], PAY_MODEL)
-        self.assertTrue(call["text"]["format"]["strict"])
+        self.assertEqual(call["input"], build_paid_input([self.prompt], "Dry & clever"))
+        self.assertNotIn("text", call)
+        self.assertEqual(len(client.responses.calls), 1)
+
+    def test_prepare_reply_for_entry_keeps_best_line_and_ascii(self):
+        prepared = prepare_reply_for_entry(
+            "Reply:\nPub trivia this serious deserves victory fries 🍟"
+        )
+        self.assertEqual(prepared, "Pub trivia this serious deserves victory fries")
+        self.assertTrue(prepared.isascii())
 
     def test_uses_selected_pay_model(self):
-        client = FakeClient([json.dumps({
-            "prompt_id": "prompt-1",
-            "reply": "I bring obscure trivia facts and dangerously confident guesses.",
-        })])
+        client = FakeClient(["A raw reply"])
 
         ReplyGenerator(client=client, model="gpt-5-mini").generate(
             [self.prompt],
@@ -156,19 +268,13 @@ class ReplyGenerationTests(unittest.TestCase):
 
         self.assertEqual(client.responses.calls[0]["model"], "gpt-5-mini")
 
-    def test_retries_once_after_malformed_output(self):
-        client = FakeClient([
-            "not json",
-            json.dumps({
-                "prompt_id": "prompt-1",
-                "reply": "Trivia rivals first, celebratory fries second?",
-            }),
-        ])
+    def test_paid_openai_failure_is_not_retried(self):
+        client = FakeClient([RuntimeError("offline"), "unused reply"])
 
-        result = ReplyGenerator(client=client).generate([self.prompt], "Playful & clean")
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+            ReplyGenerator(client=client).generate([self.prompt], "Playful & clean")
 
-        self.assertEqual(result.reply, "Trivia rivals first, celebratory fries second?")
-        self.assertEqual(len(client.responses.calls), 2)
+        self.assertEqual(len(client.responses.calls), 1)
 
     def test_rejects_unknown_prompt_and_unsafe_or_generic_text(self):
         with self.assertRaises(ReplyGenerationError):
@@ -217,20 +323,11 @@ class ReplyGenerationTests(unittest.TestCase):
         self.assertEqual(reply.reply, "Trivia rivals deserve fries!")
         self.assertTrue(reply.reply.isascii())
 
-    def test_two_failures_are_fail_closed(self):
-        client = FakeClient([RuntimeError("offline"), RuntimeError("still offline")])
-        with self.assertRaises(ReplyGenerationError):
-            ReplyGenerator(client=client).generate([self.prompt], "Playful & clean")
-        self.assertEqual(len(client.responses.calls), 2)
-
     def test_anthropic_and_gemini_models_use_their_own_apis(self):
-        reply_json = json.dumps({
-            "prompt_id": "prompt-1",
-            "reply": "Trivia night sounds like a dangerously fun first plot twist.",
-        })
-        anthropic = FakeOpener([{"content": [{"text": reply_json}]}])
+        raw_reply = "Trivia night sounds like a dangerously fun first plot twist."
+        anthropic = FakeOpener([{"content": [{"text": raw_reply}]}])
         gemini = FakeOpener([{
-            "candidates": [{"content": {"parts": [{"text": reply_json}]}}],
+            "candidates": [{"content": {"parts": [{"text": raw_reply}]}}],
         }])
 
         claude = CloudReplyGenerator(
@@ -244,10 +341,55 @@ class ReplyGenerationTests(unittest.TestCase):
             opener=gemini,
         ).generate([self.prompt], "Playful & clean")
 
-        self.assertIn("Trivia", claude.reply)
-        self.assertIn("Trivia", flash.reply)
+        self.assertEqual(claude.reply, raw_reply)
+        self.assertEqual(flash.reply, raw_reply)
         self.assertIn("api.anthropic.com", anthropic.requests[0][0].full_url)
         self.assertIn("generativelanguage.googleapis.com", gemini.requests[0][0].full_url)
+        expected_input = build_paid_input([self.prompt], "Playful & clean")
+        anthropic_payload = json.loads(anthropic.requests[0][0].data)
+        gemini_payload = json.loads(gemini.requests[0][0].data)
+        self.assertEqual(
+            anthropic_payload["messages"],
+            [{"role": "user", "content": expected_input}],
+        )
+        self.assertNotIn("system", anthropic_payload)
+        self.assertEqual(
+            gemini_payload["contents"],
+            [{"role": "user", "parts": [{"text": expected_input}]}],
+        )
+        self.assertNotIn("systemInstruction", gemini_payload)
+        self.assertNotIn("responseMimeType", gemini_payload["generationConfig"])
+
+    def test_grok_and_deepseek_use_one_raw_user_message(self):
+        raw_reply = "Trivia rivalry accepted."
+        grok_opener = FakeOpener([
+            {"choices": [{"message": {"content": raw_reply}}]},
+        ])
+        deepseek_opener = FakeOpener([
+            {"choices": [{"message": {"content": raw_reply}}]},
+        ])
+
+        grok = CloudReplyGenerator(
+            paid_model_from_selection("Grok 4"),
+            api_key="xai-test",
+            opener=grok_opener,
+        ).generate([self.prompt], "Flirty & bold")
+        deepseek = CloudReplyGenerator(
+            paid_model_from_selection("DeepSeek Chat"),
+            api_key="deepseek-test",
+            opener=deepseek_opener,
+        ).generate([self.prompt], "Flirty & bold")
+
+        self.assertEqual(grok.reply, raw_reply)
+        self.assertEqual(deepseek.reply, raw_reply)
+        expected_messages = [{
+            "role": "user",
+            "content": build_paid_input([self.prompt], "Flirty & bold"),
+        }]
+        for opener in (grok_opener, deepseek_opener):
+            payload = json.loads(opener.requests[0][0].data)
+            self.assertEqual(payload["messages"], expected_messages)
+            self.assertEqual(len(opener.requests), 1)
 
     def test_free_local_generator_uses_ollama_without_an_api_key(self):
         opener = FakeOpener([
